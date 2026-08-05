@@ -1947,7 +1947,8 @@ public:
     spatial_sum.Allocate(N_i, N_j, grid);
     spatial_sum.PackLeftConj(left);
     spatial_sum.PackRight(loopRight);
-    spatial_sum.Sum(result);
+    // spatial_sum.Sum(result);
+    spatial_sum.SumCacheBlocked(result);
   }
 };
 
@@ -2121,7 +2122,71 @@ public:
     spatial_sum.Allocate(N_i, N_j, grid);
     spatial_sum.PackLeftConj(left);
     spatial_sum.PackRight(loopRight);
-    spatial_sum.Sum(result);
+    // spatial_sum.Sum(result);
+    spatial_sum.SumCacheBlocked(result);
+  }
+};
+
+// ============================================================
+// GPU-accelerated (plain) meson field contraction -- momentum-folded.
+//
+// Companion to A2AExtendedMesonField/A2AChromoMagneticOperator above: a
+// single gamma insertion, but all requested momenta are contracted in one
+// GEMM via A2ASpatialSum::SumAllMomentaCacheBlocked (see A2ASpatialSum.h)
+// instead of one Sum() per momentum. The caller supplies the momentum
+// phase fields already built (one ComplexField per momentum, e.g. via
+// LatticeCoordinate); this class does not depend on Hadrons.
+//
+// Usage (no blocking):
+//   NewMesonField<FImpl>::compute(result, left, right, ph, gamma);
+// ============================================================
+template <typename FImpl>
+class NewMesonField
+{
+public:
+  typedef typename FImpl::FermionField FermionField;
+  typedef typename FImpl::ComplexField ComplexField;
+  typedef typename FImpl::SiteSpinor   vobj;
+  typedef typename vobj::scalar_type   scalar_type;
+  typedef typename vobj::vector_type   vector_type;
+
+  typedef iSpinColourVector<vector_type> SpinColourVector_v;
+
+  // ----------------------------------------------------------
+  // compute: GPU meson field for one gamma, all momenta at once.
+  //   No blocking - processes all N_i x N_j vectors at once.
+  //   ph[m]              - momentum phase field for momentum m
+  //   result[t][i][j][m] - rank-4 Eigen tensor (nt x N_i x N_j x nmom),
+  //                        the layout SumAllMomentaCacheBlocked expects
+  // ----------------------------------------------------------
+  template <typename TensorType>
+  static void compute(
+      TensorType &result,
+      const std::vector<FermionField> &left,
+      const std::vector<FermionField> &right,
+      const std::vector<ComplexField> &ph,
+      Gamma::Algebra g)
+  {
+    GridBase *grid = left[0].Grid();
+    int N_i  = (int)left.size();
+    int N_j  = (int)right.size();
+    int nmom = (int)ph.size();
+
+    std::vector<FermionField> gammaRight(N_j, grid);
+    for (int j = 0; j < N_j; j++)
+      A2Autils<FImpl>::GammaRight(gammaRight[j], g, right[j]);
+
+    std::vector<deviceVector<scalar_type>> ph_flat(nmom);
+    for (int m = 0; m < nmom; m++)
+      A2ASpatialSum<SpinColourVector_v>::PackPhase(grid, ph[m], ph_flat[m]);
+
+    A2ASpatialSum<SpinColourVector_v> spatial_sum;
+    spatial_sum.AllocateRight(N_j, grid, nmom);
+    spatial_sum.PackRight(gammaRight);
+    spatial_sum.ApplyPhasesRight(ph_flat);
+    spatial_sum.AllocateLeft(N_i, nmom);
+    spatial_sum.PackLeftConj(left);
+    spatial_sum.SumAllMomentaCacheBlocked(result);
   }
 };
 

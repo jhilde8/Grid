@@ -83,6 +83,13 @@ public:
   int nt, nxyz, Nsc;
   int nmom;
 
+  // Default GlobalSumVector tiling granularity for the *CacheBlocked Sum
+  // variants when a caller doesn't pick one explicitly (see the no-cacheBlock
+  // SumCacheBlocked overload below). 12 divides most A2A mode-set sizes in
+  // practice; callers with a reason to differ (e.g. Hadrons XML) should still
+  // pass cacheBlock explicitly rather than changing this.
+  static constexpr int DefaultCacheBlock = 12;
+
   deviceVector<scalar>   W_buf;
   deviceVector<scalar>   LR_buf;
   deviceVector<scalar>   EMF_buf;
@@ -374,6 +381,18 @@ public:
   // timings[2]: local fill (host_emf -> per-tile buffer), summed over tiles
   // timings[3]: GlobalSumVector, summed over tiles
   // timings[4]: scatter (per-tile buffer -> result), summed over tiles
+
+  // No-cacheBlock overload: uses DefaultCacheBlock. This is the intended
+  // call form for callers that don't need Hadrons-level control over GSV
+  // tiling (EMF, CMOF) -- the tiling granularity stays a Grid-internal
+  // concern rather than an XML-exposed parameter.
+  template <int Layout = Eigen::ColMajor>
+  void SumCacheBlocked(Eigen::Tensor<ComplexD, 3, Layout> &result,
+                       std::array<double, 5> *timings = nullptr)
+  {
+    SumCacheBlocked(result, DefaultCacheBlock, timings);
+  }
+
   template <int Layout = Eigen::ColMajor>
   void SumCacheBlocked(Eigen::Tensor<ComplexD, 3, Layout> &result,
                        int cacheBlock,
@@ -642,6 +661,18 @@ public:
   // the write into result are contiguous simultaneously. Do not "align"
   // this with SumAllMomenta's layout -- they need different ones.
   // timings[] slots match Sum()'s.
+
+  // No-cacheBlock overload: uses DefaultCacheBlock. Intended call form for
+  // callers that don't need Hadrons-level control over GSV tiling (EMF,
+  // CMOF, and any other nmom=1 caller of this engine) -- mirrors
+  // SumCacheBlocked's no-cacheBlock overload above.
+  template <int Layout = Eigen::ColMajor>
+  void SumAllMomentaCacheBlocked(Eigen::Tensor<ComplexD, 4, Layout> &result,
+                                 std::array<double, 5> *timings = nullptr)
+  {
+    SumAllMomentaCacheBlocked(result, DefaultCacheBlock, timings);
+  }
+
   template <int Layout = Eigen::ColMajor>
   void SumAllMomentaCacheBlocked(Eigen::Tensor<ComplexD, 4, Layout> &result,
                                  int cacheBlock,
