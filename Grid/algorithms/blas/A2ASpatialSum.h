@@ -506,6 +506,38 @@ public:
         phase_data[l_xyz] = ph_s[0];
       }
     });
+
+    // -- Temporary self-check for the MF/NMF momentum-independence bug hunt --
+    // Cross-checks the manual SIMD/lane extraction above against Grid's own,
+    // independently-implemented peekLocalSite (uses grid->oIndex/iIndex, not
+    // Lexicographic::CoorFromIndex), plus a unit-modulus check that doesn't
+    // depend on knowing the "right" value in advance (any momentum phase
+    // must have |ph|=1 everywhere). Host-only, serial -- remove once the
+    // MF/NMF bug is resolved.
+    {
+      typedef typename phvobj::scalar_object phsobj;
+      double  maxAbsDiff    = 0.0;
+      double  maxModErr     = 0.0;
+      int64_t worstDiffSite = -1;
+      Coordinate coor(nd);
+      for (int64_t l_xyz = 0; l_xyz < lnxyz; l_xyz++)
+      {
+        Lexicographic::CoorFromIndex(coor, l_xyz, ldims);
+        phsobj trusted;
+        peekLocalSite(trusted, ph, coor);
+        scalar *trusted_s = (scalar *)&trusted;
+
+        double diff   = std::abs(phase_data[l_xyz] - trusted_s[0]);
+        double modErr = std::abs(std::abs(phase_data[l_xyz]) - 1.0);
+        if (diff > maxAbsDiff) { maxAbsDiff = diff; worstDiffSite = l_xyz; }
+        if (modErr > maxModErr) maxModErr = modErr;
+      }
+      if (_grid->ThisRank() == 0)
+        std::cout << GridLogMessage << "PackPhase self-check: max|packed-trusted|="
+                  << maxAbsDiff << " (worst l_xyz=" << worstDiffSite
+                  << "), max||packed|-1|=" << maxModErr
+                  << " over " << lnxyz << " sites" << std::endl;
+    }
   }
 
   // Multiply LR_buf[t][j][l_xyz*Nsc + sc] by phase_buf[l_xyz] for all (t, j, sc).
