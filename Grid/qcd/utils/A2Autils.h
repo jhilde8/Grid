@@ -2183,7 +2183,7 @@ public:
     A2ASpatialSum<SpinColourVector_v> spatial_sum;
     spatial_sum.AllocateRight(N_j, grid, nmom);
     spatial_sum.PackRight(gammaRight);
-    spatial_sum.ApplyPhasesRight(ph_flat);
+    spatial_sum.ApplyAllPhaseRight(ph_flat);
     spatial_sum.AllocateLeft(N_i, nmom);
     spatial_sum.PackLeftConj(left);
     spatial_sum.SumAllMomentaCacheBlocked(result);

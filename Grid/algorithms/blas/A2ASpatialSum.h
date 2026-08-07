@@ -56,7 +56,7 @@ NAMESPACE_BEGIN(Grid);
 
   Multi-momentum path (SumAllMomenta): folds a momentum index into the
   GEMM's N dimension instead of redoing the whole GEMM once per momentum.
-  ApplyPhasesRight reads the single unphased pack in LR_buf (built by the
+  ApplyAllPhaseRight reads the single unphased pack in LR_buf (built by the
   existing PackRight, unchanged) and writes nmom phase-multiplied copies
   into a separate, wider buffer:
 
@@ -548,15 +548,21 @@ public:
     const scalar *ph  = &phase_buf[0];
     int lN_j = N_j, lnxyz = nxyz, lNsc = Nsc, lnt = nt;
     accelerator_for(idx, (size_t)(lN_j * lnxyz), lNsc, {
-      int    j     = idx / lnxyz;
-      int    l_xyz = idx % lnxyz;
-      int    sc    = acceleratorSIMTlane(lNsc);
+      int    j      = idx / lnxyz;
+      int    l_xyz  = idx % lnxyz;
       scalar ph_val = ph[l_xyz];
-      for (int t = 0; t < lnt; t++) {
-        int64_t base = (int64_t)t * lN_j * lnxyz * lNsc
-                     + (int64_t)j * lnxyz * lNsc
-                     + l_xyz * lNsc;
-        LR[base + sc] *= ph_val;
+#ifdef GRID_SIMT
+      {
+        int sc = acceleratorSIMTlane(lNsc);
+#else
+        for (int sc = 0; sc < lNsc; sc++) {
+#endif
+        for (int t = 0; t < lnt; t++) {
+          int64_t base = (int64_t)t * lN_j * lnxyz * lNsc
+                       + (int64_t)j * lnxyz * lNsc
+                       + l_xyz * lNsc;
+          LR[base + sc] *= ph_val;
+        }
       }
     });
   }
@@ -566,7 +572,7 @@ public:
   // l_xyz*Nsc+sc]. One kernel launch, with m folded into the parallel index
   // space alongside (j, l_xyz) -- not nmom separate launches. Requires the
   // three-argument AllocateRight to have been called first.
-  void ApplyPhasesRight(const std::vector<deviceVector<scalar>> &phase_bufs)
+  void ApplyAllPhaseRight(const std::vector<deviceVector<scalar>> &phase_bufs)
   {
     GRID_ASSERT((int)phase_bufs.size() == nmom);
 
@@ -584,24 +590,30 @@ public:
       int    rem    = idx % (lN_j * lnxyz);
       int    j      = rem / lnxyz;
       int    l_xyz  = rem % lnxyz;
-      int    sc     = acceleratorSIMTlane(lNsc);
       scalar ph_val = ph[m][l_xyz];
-      for (int t = 0; t < lnt; t++) {
-        int64_t src = (int64_t)t * lN_j * lnxyz * lNsc
-                    + (int64_t)j * lnxyz * lNsc
-                    + l_xyz * lNsc;
-        int64_t dst = (int64_t)t * lnmom * lN_j * lnxyz * lNsc
-                    + (int64_t)m * lN_j * lnxyz * lNsc
-                    + (int64_t)j * lnxyz * lNsc
-                    + l_xyz * lNsc;
-        LRM[dst + sc] = LR[src + sc] * ph_val;
+#ifdef GRID_SIMT
+      {
+        int sc = acceleratorSIMTlane(lNsc);
+#else
+        for (int sc = 0; sc < lNsc; sc++) {
+#endif
+        for (int t = 0; t < lnt; t++) {
+          int64_t src = (int64_t)t * lN_j * lnxyz * lNsc
+                      + (int64_t)j * lnxyz * lNsc
+                      + l_xyz * lNsc;
+          int64_t dst = (int64_t)t * lnmom * lN_j * lnxyz * lNsc
+                      + (int64_t)m * lN_j * lnxyz * lNsc
+                      + (int64_t)j * lnxyz * lNsc
+                      + l_xyz * lNsc;
+          LRM[dst + sc] = LR[src + sc] * ph_val;
+        }
       }
     });
   }
 
   // Batched GEMM + MPI reduction, folding momentum into N: same K=nxyz*Nsc
   // and M=N_i as Sum(), N widens from N_j to nmom*N_j by reading
-  // LR_mom_ptrs/EMF_mom_ptrs (built by ApplyPhasesRight and the
+  // LR_mom_ptrs/EMF_mom_ptrs (built by ApplyAllPhaseRight and the
   // three-argument Allocate* overloads) instead of LR_ptrs/EMF_ptrs. One
   // GEMM and one GlobalSumVector for the whole block, covering every
   // momentum, instead of one pair per momentum via Sum().
