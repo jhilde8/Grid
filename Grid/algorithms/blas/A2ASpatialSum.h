@@ -308,9 +308,19 @@ public:
   // timings[2]: transpose (host_emf -> global_emf)
   // timings[3]: GlobalSumVector
   // timings[4]: transpose (global_emf -> result)
+  //
+  // bytesMoved mirrors timings[1..4] (slot 0/GEMM is FLOP-bound, not
+  // bandwidth-bound, so left untouched) with the bytes handled by that stage,
+  // summed the same way (+=) so a caller accumulating timings across many
+  // calls (e.g. per cache-block tile) gets a matching total to divide by for
+  // an average throughput. [1]/[3] count the buffer once (one-directional
+  // copy / the message GlobalSumVector reduces); [2]/[4] count read+write
+  // (2x element count) since both are host-side gather/scatter touching two
+  // separate buffers.
   template <int Layout = Eigen::ColMajor>
   void Sum(Eigen::Tensor<ComplexD, 3, Layout> &result,
-           std::array<double, 5> *timings = nullptr)
+           std::array<double, 5> *timings = nullptr,
+           std::array<double, 5> *bytesMoved = nullptr)
   {
     GridBLAS BLAS;
     double dt;
@@ -338,6 +348,7 @@ public:
                               nt * N_j * N_i * sizeof(scalar));
     dt += usecond();
     if (timings) (*timings)[1] += dt;
+    if (bytesMoved) (*bytesMoved)[1] += (double)nt * N_j * N_i * sizeof(scalar);
 
     // Both loops are pure host-side CPU work; loop nests are perfectly nested
     // for collapse(3) following the thread_for_collapse precedent at A2Autils.h:1503.
@@ -351,11 +362,13 @@ public:
     });
     dt += usecond();
     if (timings) (*timings)[2] += dt;
+    if (bytesMoved) (*bytesMoved)[2] += 2.0 * nt * N_i * N_j * sizeof(scalar);
 
     dt = -usecond();
     grid->GlobalSumVector(global_emf.data(), nt_global * N_i * N_j);
     dt += usecond();
     if (timings) (*timings)[3] += dt;
+    if (bytesMoved) (*bytesMoved)[3] += (double)nt_global * N_i * N_j * sizeof(scalar);
 
     dt = -usecond();
     thread_for_collapse(3, gt, nt_global, {
@@ -365,6 +378,7 @@ public:
     });
     dt += usecond();
     if (timings) (*timings)[4] += dt;
+    if (bytesMoved) (*bytesMoved)[4] += 2.0 * nt_global * N_i * N_j * sizeof(scalar);
   }
 
   // Same GEMM as Sum() (M=N_i, N=N_j, K=nxyz*Nsc, run once at full block
@@ -388,15 +402,21 @@ public:
   // concern rather than an XML-exposed parameter.
   template <int Layout = Eigen::ColMajor>
   void SumCacheBlocked(Eigen::Tensor<ComplexD, 3, Layout> &result,
-                       std::array<double, 5> *timings = nullptr)
+                       std::array<double, 5> *timings = nullptr,
+                       std::array<double, 5> *bytesMoved = nullptr)
   {
-    SumCacheBlocked(result, DefaultCacheBlock, timings);
+    SumCacheBlocked(result, DefaultCacheBlock, timings, bytesMoved);
   }
 
+  // bytesMoved: see the comment above Sum() -- same [1..4] convention,
+  // accumulated per (ii,jj) tile the same way timings is, so the totals
+  // after the full N_i x N_j sweep match Sum()'s single-call totals
+  // regardless of cacheBlock (only the call count and per-call size differ).
   template <int Layout = Eigen::ColMajor>
   void SumCacheBlocked(Eigen::Tensor<ComplexD, 3, Layout> &result,
                        int cacheBlock,
-                       std::array<double, 5> *timings = nullptr)
+                       std::array<double, 5> *timings = nullptr,
+                       std::array<double, 5> *bytesMoved = nullptr)
   {
     GridBLAS BLAS;
     double dt;
@@ -424,6 +444,7 @@ public:
                               nt * N_j * N_i * sizeof(scalar));
     dt += usecond();
     if (timings) (*timings)[1] += dt;
+    if (bytesMoved) (*bytesMoved)[1] += (double)nt * N_j * N_i * sizeof(scalar);
 
     for (int ii = 0; ii < N_i; ii += cacheBlock)
     {
@@ -442,11 +463,13 @@ public:
         });
         dt += usecond();
         if (timings) (*timings)[2] += dt;
+        if (bytesMoved) (*bytesMoved)[2] += 2.0 * nt * Niii * Njjj * sizeof(scalar);
 
         dt = -usecond();
         grid->GlobalSumVector(tile.data(), (size_t)nt_global * Niii * Njjj);
         dt += usecond();
         if (timings) (*timings)[3] += dt;
+        if (bytesMoved) (*bytesMoved)[3] += (double)nt_global * Niii * Njjj * sizeof(scalar);
 
         dt = -usecond();
         thread_for_collapse(3, gt, nt_global, {
@@ -457,6 +480,7 @@ public:
         });
         dt += usecond();
         if (timings) (*timings)[4] += dt;
+        if (bytesMoved) (*bytesMoved)[4] += 2.0 * nt_global * Niii * Njjj * sizeof(scalar);
       }
     }
   }
@@ -506,38 +530,6 @@ public:
         phase_data[l_xyz] = ph_s[0];
       }
     });
-
-    // -- Temporary self-check for the MF/NMF momentum-independence bug hunt --
-    // Cross-checks the manual SIMD/lane extraction above against Grid's own,
-    // independently-implemented peekLocalSite (uses grid->oIndex/iIndex, not
-    // Lexicographic::CoorFromIndex), plus a unit-modulus check that doesn't
-    // depend on knowing the "right" value in advance (any momentum phase
-    // must have |ph|=1 everywhere). Host-only, serial -- remove once the
-    // MF/NMF bug is resolved.
-    {
-      typedef typename phvobj::scalar_object phsobj;
-      double  maxAbsDiff    = 0.0;
-      double  maxModErr     = 0.0;
-      int64_t worstDiffSite = -1;
-      Coordinate coor(nd);
-      for (int64_t l_xyz = 0; l_xyz < lnxyz; l_xyz++)
-      {
-        Lexicographic::CoorFromIndex(coor, l_xyz, ldims);
-        phsobj trusted;
-        peekLocalSite(trusted, ph, coor);
-        scalar *trusted_s = (scalar *)&trusted;
-
-        double diff   = std::abs(phase_data[l_xyz] - trusted_s[0]);
-        double modErr = std::abs(std::abs(phase_data[l_xyz]) - 1.0);
-        if (diff > maxAbsDiff) { maxAbsDiff = diff; worstDiffSite = l_xyz; }
-        if (modErr > maxModErr) maxModErr = modErr;
-      }
-      if (_grid->ThisRank() == 0)
-        std::cout << GridLogMessage << "PackPhase self-check: max|packed-trusted|="
-                  << maxAbsDiff << " (worst l_xyz=" << worstDiffSite
-                  << "), max||packed|-1|=" << maxModErr
-                  << " over " << lnxyz << " sites" << std::endl;
-    }
   }
 
   // Multiply LR_buf[t][j][l_xyz*Nsc + sc] by phase_buf[l_xyz] for all (t, j, sc).
@@ -623,10 +615,13 @@ public:
   // own fastest sub-index (col=m*N_j+j, j fastest) and global_emf's own
   // layout (col fastest); the final transpose becomes a straight contiguous
   // copy on both sides instead of a stride-nmom scatter into result.
-  // timings[] slots match Sum()'s.
+  // timings[] slots match Sum()'s; bytesMoved[] mirrors timings[1..4] the
+  // same way as Sum() (see comment above Sum()), with N_j widened to
+  // nmom*N_j throughout since every stage here reads/writes the wide buffers.
   template <int Layout = Eigen::ColMajor>
   void SumAllMomenta(Eigen::Tensor<ComplexD, 4, Layout> &result,
-                      std::array<double, 5> *timings = nullptr)
+                      std::array<double, 5> *timings = nullptr,
+                      std::array<double, 5> *bytesMoved = nullptr)
   {
     GridBLAS BLAS;
     double dt;
@@ -656,6 +651,7 @@ public:
                               (size_t)nt * Nwide * N_i * sizeof(scalar));
     dt += usecond();
     if (timings) (*timings)[1] += dt;
+    if (bytesMoved) (*bytesMoved)[1] += (double)nt * Nwide * N_i * sizeof(scalar);
 
     std::vector<scalar> global_emf((size_t)nt_global * N_i * Nwide, scalar(0.0));
     dt = -usecond();
@@ -667,11 +663,13 @@ public:
     });
     dt += usecond();
     if (timings) (*timings)[2] += dt;
+    if (bytesMoved) (*bytesMoved)[2] += 2.0 * nt * N_i * Nwide * sizeof(scalar);
 
     dt = -usecond();
     grid->GlobalSumVector(global_emf.data(), (size_t)nt_global * N_i * Nwide);
     dt += usecond();
     if (timings) (*timings)[3] += dt;
+    if (bytesMoved) (*bytesMoved)[3] += (double)nt_global * N_i * Nwide * sizeof(scalar);
 
     dt = -usecond();
     thread_for_collapse(3, gt, nt_global, {
@@ -684,6 +682,7 @@ public:
     });
     dt += usecond();
     if (timings) (*timings)[4] += dt;
+    if (bytesMoved) (*bytesMoved)[4] += 2.0 * nt_global * N_i * Nwide * sizeof(scalar);
   }
 
   // Same GEMM as SumAllMomenta (M=N_i, N=nmom*N_j, K=nxyz*Nsc, momentum
@@ -712,15 +711,20 @@ public:
   // SumCacheBlocked's no-cacheBlock overload above.
   template <int Layout = Eigen::ColMajor>
   void SumAllMomentaCacheBlocked(Eigen::Tensor<ComplexD, 4, Layout> &result,
-                                 std::array<double, 5> *timings = nullptr)
+                                 std::array<double, 5> *timings = nullptr,
+                                 std::array<double, 5> *bytesMoved = nullptr)
   {
-    SumAllMomentaCacheBlocked(result, DefaultCacheBlock, timings);
+    SumAllMomentaCacheBlocked(result, DefaultCacheBlock, timings, bytesMoved);
   }
 
+  // bytesMoved: see the comment above SumCacheBlocked() -- same per-tile
+  // accumulation, with the momentum count folded into each tile's element
+  // count (nmom is part of the wide dimension being tiled).
   template <int Layout = Eigen::ColMajor>
   void SumAllMomentaCacheBlocked(Eigen::Tensor<ComplexD, 4, Layout> &result,
                                  int cacheBlock,
-                                 std::array<double, 5> *timings = nullptr)
+                                 std::array<double, 5> *timings = nullptr,
+                                 std::array<double, 5> *bytesMoved = nullptr)
   {
     GridBLAS BLAS;
     double dt;
@@ -750,6 +754,7 @@ public:
                               (size_t)nt * Nwide * N_i * sizeof(scalar));
     dt += usecond();
     if (timings) (*timings)[1] += dt;
+    if (bytesMoved) (*bytesMoved)[1] += (double)nt * Nwide * N_i * sizeof(scalar);
 
     int lN_j = N_j, lnmom = nmom;
     for (int ii = 0; ii < N_i; ii += cacheBlock)
@@ -772,11 +777,13 @@ public:
         });
         dt += usecond();
         if (timings) (*timings)[2] += dt;
+        if (bytesMoved) (*bytesMoved)[2] += 2.0 * nt * Niii * Njjj * lnmom * sizeof(scalar);
 
         dt = -usecond();
         grid->GlobalSumVector(tile.data(), (size_t)nt_global * Niii * Njjj * nmom);
         dt += usecond();
         if (timings) (*timings)[3] += dt;
+        if (bytesMoved) (*bytesMoved)[3] += (double)nt_global * Niii * Njjj * lnmom * sizeof(scalar);
 
         dt = -usecond();
         thread_for_collapse(4, gt, nt_global, {
@@ -788,6 +795,7 @@ public:
         });
         dt += usecond();
         if (timings) (*timings)[4] += dt;
+        if (bytesMoved) (*bytesMoved)[4] += 2.0 * nt_global * Niii * Njjj * lnmom * sizeof(scalar);
       }
     }
   }
