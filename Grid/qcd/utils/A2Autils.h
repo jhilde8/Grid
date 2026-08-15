@@ -56,7 +56,40 @@ public:
 
   typedef iSpinColourMatrix<vector_type> SpinColourMatrix_v;
 
-  
+  // Unpack a set of SIMD-binned A2A vectors (as read from disk, e.g. via
+  // Hadrons::A2AVectorsIo::read) into individual FermionFields, writing
+  // into out[offset : offset + bvec.size()*binSize). Shared by any loader
+  // that reads this on-disk binned format, so the CPU-view workaround
+  // below only needs to be gotten right once.
+  //
+  // Uses CPU views rather than peekLorentz: peekLorentz launches a GPU
+  // kernel that copies the full binSize-wide binned site object
+  // (~binSize*192 bytes) onto each GPU thread's private stack, which
+  // overflows the device stack limit for large binSize. Reading via
+  // CpuRead and writing via CpuWrite bypasses the GPU kernel entirely;
+  // the memory manager migrates the unpacked data to the device on the
+  // first GPU access.
+  template <int binSize>
+  static void UnpackBinnedVectors(std::vector<FermionField> &out, unsigned int offset,
+                                   const std::vector<Lattice<iVector<vobj, binSize>>> &bvec)
+  {
+    int Nb = bvec.size();
+
+    for (int ib = 0; ib < Nb; ++ib)
+    {
+      autoView(bv, bvec[ib], CpuRead);
+      for (int j = 0; j < binSize; ++j)
+      {
+        autoView(vv, out[offset + ib*binSize + j], CpuWrite);
+        uint64_t nSites = bv.size();
+        for (uint64_t ss = 0; ss < nSites; ++ss)
+        {
+          vv[ss] = bv[ss]._internal[j];
+        }
+      }
+    }
+  }
+
   // output: rank 5 tensor, e.g. Eigen::Tensor<ComplexD, 5>
   template <typename TensorType>
   static void MesonField(TensorType &mat,
@@ -1641,6 +1674,48 @@ public:
     for (int k = 0; k < Nk; k++) {
       v1.push_back(loop1[k].View(AcceleratorRead));
       v2.push_back(loop2[k].View(AcceleratorRead));
+    }
+
+    deviceVector<SpinColourVector_v *> l1p(Nk), l2p(Nk);
+    for (int k = 0; k < Nk; k++) {
+      acceleratorPut(l1p[k], &v1[k][0]);
+      acceleratorPut(l2p[k], &v2[k][0]);
+    }
+
+    autoView(loopv, loop, AcceleratorWrite);
+    SpinColourVector_v **l1 = &l1p[0];
+    SpinColourVector_v **l2 = &l2p[0];
+    int lNk = Nk;
+    accelerator_for(ss, oSites, Nsimd, {
+      auto res = outerProduct(coalescedRead(l1[0][ss]), coalescedRead(l2[0][ss]));
+      for (int k = 1; k < lNk; k++)
+        res = res + outerProduct(coalescedRead(l1[k][ss]), coalescedRead(l2[k][ss]));
+      coalescedWrite(loopv[ss], res);
+    });
+    for (int k = 0; k < Nk; k++) {
+      v1[k].ViewClose();
+      v2[k].ViewClose();
+    }
+  }
+
+  // ----------------------------------------------------------
+  // Same as LoopPropagator, but loop1/loop2 are already-built pointers
+  // (e.g. a slice of a larger resident array) rather than owned arrays.
+  // ----------------------------------------------------------
+  static void LoopPropagatorPtr(PropagatorField &loop,
+                                  const std::vector<const FermionField *> &loop1,
+                                  const std::vector<const FermionField *> &loop2)
+  {
+    int Nk          = (int)loop1.size();
+    uint64_t oSites = loop.Grid()->oSites();
+    int Nsimd       = SpinColourVector_v::Nsimd();
+
+    typedef decltype(loop1[0]->View(AcceleratorRead)) View;
+    std::vector<View> v1, v2;
+    v1.reserve(Nk); v2.reserve(Nk);
+    for (int k = 0; k < Nk; k++) {
+      v1.push_back(loop1[k]->View(AcceleratorRead));
+      v2.push_back(loop2[k]->View(AcceleratorRead));
     }
 
     deviceVector<SpinColourVector_v *> l1p(Nk), l2p(Nk);
