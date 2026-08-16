@@ -379,17 +379,20 @@ public:
 
 // ================================================================
 // Drives the real A2AExtendedMesonField<FImpl> kernels from
-// Grid/qcd/utils/A2Autils.h. These used to be duplicated here as free
-// functions, from before the kernels were ported into A2Autils; now
-// that A2Autils has the live, performant versions -- including its own
-// compute(), which runs the full LoopContractionTypeN ->
-// LoopRightContractionTypeN -> A2ASpatialSum::SumCacheBlocked pipeline
-// -- this calls them directly instead of testing a frozen copy.
-// use_ptr selects whether the loop propagator is built via
-// LoopPropagator (owned arrays) or LoopPropagatorPtr (pointers into
-// the same arrays); everything downstream of `loop` is the same
-// compute() call either way, so any mismatch between the two can only
-// come from that one call.
+// Grid/qcd/utils/A2Autils.h -- LoopPropagator/LoopPropagatorPtr,
+// LoopContractionTypeN, LoopRightContractionTypeN, A2ASpatialSum --
+// with the same per-stage Tms()/tag timing structure as
+// A2AExtendedMesonFieldRef::compute() above, so the ref/blas/gpu/
+// gpu_ptr paths are directly comparable stage by stage in the log.
+// This calls the real A2Autils.h kernels directly rather than testing
+// a duplicated copy (as this file used to, from before the kernels
+// were ported into A2Autils); it doesn't route through A2Autils.h's
+// own compute() convenience wrapper, since that doesn't expose
+// per-stage timing. use_ptr selects whether the loop propagator is
+// built via LoopPropagator (owned arrays) or LoopPropagatorPtr
+// (pointers into the same arrays); every stage after loop_build calls
+// the identical real kernel either way, so any timing or numerical
+// difference between the two can only come from that one stage.
 // ================================================================
 void A2AExtendedMesonFieldKernels(
     Eigen::Tensor<ComplexD, 3> &result,
@@ -397,16 +400,27 @@ void A2AExtendedMesonFieldKernels(
     const std::vector<FermionField> &right,
     const std::vector<FermionField> &loop1,
     const std::vector<FermionField> &loop2,
-    const std::vector<Gamma::Algebra> &gamma1,
-    const std::vector<Gamma::Algebra> &gamma2,
+    const std::vector<Gamma::Algebra> &gamma1_in,
+    const std::vector<Gamma::Algebra> &gamma2_in,
     int type,
     bool use_ptr)
 {
   typedef Grid::A2AExtendedMesonField<FImpl> EMF;
 
   GridBase *grid = left[0].Grid();
-  PropagatorField loop(grid);
+  int N_i = (int)left.size();
+  int N_j = (int)right.size();
 
+  std::string tag = std::string("[gpu  type=") + std::to_string(type)
+                   + (use_ptr ? " ptr]" : " ref]");
+  auto Tms = [](double us) { return us * 1e-3; };
+  double t0;
+
+  Vector<Gamma::Algebra> gamma1(gamma1_in.begin(), gamma1_in.end());
+  Vector<Gamma::Algebra> gamma2(gamma2_in.begin(), gamma2_in.end());
+
+  t0 = usecond();
+  PropagatorField loop(grid);
   if (use_ptr) {
     std::vector<const FermionField *> ptr1, ptr2;
     ptr1.reserve(loop1.size());
@@ -417,8 +431,51 @@ void A2AExtendedMesonFieldKernels(
   } else {
     EMF::LoopPropagator(loop, loop1, loop2);
   }
+  std::cout << GridLogMessage << tag << " loop_build:      " << Tms(usecond()-t0) << " ms\n";
 
-  EMF::compute(result, left, right, loop, gamma1, gamma2, type);
+  t0 = usecond();
+  PropagatorField tloop(grid);
+  tloop = Zero();
+  switch (type) {
+  case 0: EMF::LoopContractionType0(tloop, loop);                break;
+  case 1: EMF::LoopContractionType1(tloop, loop, gamma1, gamma2); break;
+  case 2: EMF::LoopContractionType2(tloop, loop, gamma2);         break;
+  case 3: EMF::LoopContractionType3(tloop, loop, gamma1, gamma2); break;
+  }
+  std::cout << GridLogMessage << tag << " tloop:           " << Tms(usecond()-t0) << " ms\n";
+
+  t0 = usecond();
+  std::vector<FermionField> loopRight(N_j, grid);
+  for (int j = 0; j < N_j; j++) {
+    switch (type) {
+    case 0: EMF::LoopRightContractionType0(loopRight[j], tloop, right[j], gamma1, gamma2); break;
+    case 1: EMF::LoopRightContractionType1(loopRight[j], tloop, right[j]);                 break;
+    case 2: EMF::LoopRightContractionType2(loopRight[j], tloop, right[j], gamma1);         break;
+    case 3: EMF::LoopRightContractionType3(loopRight[j], tloop, right[j]);                 break;
+    }
+  }
+  std::cout << GridLogMessage << tag << " pack_loopright:  " << Tms(usecond()-t0) << " ms\n";
+
+  A2ASpatialSum<SpinColourVector_v> spatial_sum;
+  double t_blas = usecond();
+
+  t0 = usecond();
+  spatial_sum.Allocate(N_i, N_j, grid);
+  std::cout << GridLogMessage << tag << " Allocate:        " << Tms(usecond()-t0) << " ms\n";
+
+  t0 = usecond();
+  spatial_sum.PackLeftConj(left);
+  std::cout << GridLogMessage << tag << " PackLeftConj:    " << Tms(usecond()-t0) << " ms\n";
+
+  t0 = usecond();
+  spatial_sum.PackRight(loopRight);
+  std::cout << GridLogMessage << tag << " PackRight:       " << Tms(usecond()-t0) << " ms\n";
+
+  t0 = usecond();
+  spatial_sum.SumCacheBlocked(result);
+  std::cout << GridLogMessage << tag << " Sum (GEMM+MPI):  " << Tms(usecond()-t0) << " ms\n";
+
+  std::cout << GridLogMessage << tag << " A2ASpatialSum:   " << Tms(usecond()-t_blas) << " ms  [TOTAL]\n";
 }
 
 int main(int argc, char *argv[])
@@ -519,18 +576,28 @@ int main(int argc, char *argv[])
     double rel_gpu_ptr    = (norm2_ref > 0) ? std::sqrt(norm2_diff_gpu_ptr / norm2_ref) : 0.0;
     double rel_ptr_vs_gpu = (norm2_gpu > 0) ? std::sqrt(norm2_diff_ptr_vs_gpu / norm2_gpu) : 0.0;
 
+    std::cout << GridLogMessage << "type=" << type << std::endl;
     std::cout << GridLogMessage
-              << "type=" << type
               << "  norm2_ref="     << norm2_ref
               << "  norm2_blas="    << norm2_blas
+              << std::endl;
+    std::cout << GridLogMessage
               << "  norm2_gpu="     << norm2_gpu
               << "  norm2_gpu_ptr=" << norm2_gpu_ptr
-              << "  rel_blas="       << rel_blas
-              << "  rel_gpu="        << rel_gpu
+              << std::endl;
+    std::cout << GridLogMessage
+              << "  rel_blas="    << rel_blas
+              << "  rel_gpu="     << rel_gpu
+              << std::endl;
+    std::cout << GridLogMessage
               << "  rel_gpu_ptr="    << rel_gpu_ptr
               << "  rel_ptr_vs_gpu=" << rel_ptr_vs_gpu
-              << "  t_ref="     << t_ref     * 1e-6 << "s"
-              << "  t_blas="    << t_blas    * 1e-6 << "s"
+              << std::endl;
+    std::cout << GridLogMessage
+              << "  t_ref="  << t_ref  * 1e-6 << "s"
+              << "  t_blas=" << t_blas * 1e-6 << "s"
+              << std::endl;
+    std::cout << GridLogMessage
               << "  t_gpu="     << t_gpu     * 1e-6 << "s"
               << "  t_gpu_ptr=" << t_gpu_ptr * 1e-6 << "s"
               << std::endl;
