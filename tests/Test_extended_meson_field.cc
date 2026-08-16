@@ -378,345 +378,48 @@ public:
 };
 
 // ================================================================
-// Free-function GPU kernels — accelerator_for, v(ss) reads,
-// coalescedWrite writes, vobj-level arithmetic throughout.
-// Gamma arrays passed as Vector<Gamma::Algebra> (UVM).
+// Drives the real A2AExtendedMesonField<FImpl> kernels from
+// Grid/qcd/utils/A2Autils.h. These used to be duplicated here as free
+// functions, from before the kernels were ported into A2Autils; now
+// that A2Autils has the live, performant versions -- including its own
+// compute(), which runs the full LoopContractionTypeN ->
+// LoopRightContractionTypeN -> A2ASpatialSum::SumCacheBlocked pipeline
+// -- this calls them directly instead of testing a frozen copy.
+// use_ptr selects whether the loop propagator is built via
+// LoopPropagator (owned arrays) or LoopPropagatorPtr (pointers into
+// the same arrays); everything downstream of `loop` is the same
+// compute() call either way, so any mismatch between the two can only
+// come from that one call.
 // ================================================================
-
-void A2ALoopPropagator(PropagatorField &loop,
-                       const std::vector<FermionField> &loop1,
-                       const std::vector<FermionField> &loop2)
+void A2AExtendedMesonFieldKernels(
+    Eigen::Tensor<ComplexD, 3> &result,
+    const std::vector<FermionField> &left,
+    const std::vector<FermionField> &right,
+    const std::vector<FermionField> &loop1,
+    const std::vector<FermionField> &loop2,
+    const std::vector<Gamma::Algebra> &gamma1,
+    const std::vector<Gamma::Algebra> &gamma2,
+    int type,
+    bool use_ptr)
 {
-  int Nk      = (int)loop1.size();
-  uint64_t oSites = loop.Grid()->oSites();
-  int Nsimd   = SpinColourVector_v::Nsimd();
+  typedef Grid::A2AExtendedMesonField<FImpl> EMF;
 
-  typedef decltype(loop1[0].View(AcceleratorRead)) View;
-  std::vector<View> v1, v2;
-  v1.reserve(Nk); v2.reserve(Nk);
-  for (int k = 0; k < Nk; k++) {
-    v1.push_back(loop1[k].View(AcceleratorRead));
-    v2.push_back(loop2[k].View(AcceleratorRead));
+  GridBase *grid = left[0].Grid();
+  PropagatorField loop(grid);
+
+  if (use_ptr) {
+    std::vector<const FermionField *> ptr1, ptr2;
+    ptr1.reserve(loop1.size());
+    ptr2.reserve(loop2.size());
+    for (auto &f : loop1) ptr1.push_back(&f);
+    for (auto &f : loop2) ptr2.push_back(&f);
+    EMF::LoopPropagatorPtr(loop, ptr1, ptr2);
+  } else {
+    EMF::LoopPropagator(loop, loop1, loop2);
   }
 
-  deviceVector<SpinColourVector_v *> l1p(Nk), l2p(Nk);
-  for (int k = 0; k < Nk; k++) {
-    acceleratorPut(l1p[k], &v1[k][0]);
-    acceleratorPut(l2p[k], &v2[k][0]);
-  }
-
-  autoView(loopv, loop, AcceleratorWrite);
-  SpinColourVector_v **l1 = &l1p[0];
-  SpinColourVector_v **l2 = &l2p[0];
-  int lNk = Nk;
-  accelerator_for(ss, oSites, Nsimd, {
-    auto result = outerProduct(coalescedRead(l1[0][ss]), coalescedRead(l2[0][ss]));
-    for (int k = 1; k < lNk; k++)
-      result = result + outerProduct(coalescedRead(l1[k][ss]), coalescedRead(l2[k][ss]));
-    coalescedWrite(loopv[ss], result);
-  });
-  for (int k = 0; k < Nk; k++) {
-    v1[k].ViewClose();
-    v2[k].ViewClose();
-  }
+  EMF::compute(result, left, right, loop, gamma1, gamma2, type);
 }
-
-// Type 0: colour-trace stored in (s1,s2)(0,0)
-void A2ALoopContractionType0(PropagatorField &tloop, const PropagatorField &loop)
-{
-  autoView(tloopv, tloop, AcceleratorWrite);
-  autoView(loopv,  loop,  AcceleratorRead);
-  uint64_t Osites = loop.Grid()->oSites();
-  int Nsimd = SpinColourMatrix_v::Nsimd();
-  accelerator_for(ss, Osites, Nsimd, {
-    auto l = loopv(ss);
-    auto tmp = l; tmp = Zero();
-    for (int s1 = 0; s1 < Ns; ++s1)
-    for (int s2 = 0; s2 < Ns; ++s2)
-      tmp()(s1,s2)(0,0) = l()(s1,s2)(0,0) + l()(s1,s2)(1,1) + l()(s1,s2)(2,2);
-    coalescedWrite(tloopv[ss], tmp);
-  });
-}
-
-// Type 1: tloop = sum_mu Gamma(g1[mu]) * loop * Gamma(g2[mu])
-void A2ALoopContractionType1(PropagatorField &tloop, const PropagatorField &loop,
-                                  const Vector<Gamma::Algebra> &gamma1,
-                                  const Vector<Gamma::Algebra> &gamma2)
-{
-  int ng = (int)gamma1.size();
-  const Gamma::Algebra *g1 = gamma1.data();
-  const Gamma::Algebra *g2 = gamma2.data();
-  autoView(tloopv, tloop, AcceleratorWrite);
-  autoView(loopv,  loop,  AcceleratorRead);
-  uint64_t Osites = loop.Grid()->oSites();
-  int Nsimd = SpinColourMatrix_v::Nsimd();
-  accelerator_for(ss, Osites, Nsimd, {
-    auto l = loopv(ss);
-    auto tmp = l; tmp = Zero();
-    for (int mu = 0; mu < ng; ++mu)
-      tmp = tmp + Gamma(g1[mu]) * l * Gamma(g2[mu]);
-    coalescedWrite(tloopv[ss], tmp);
-  });
-}
-
-// Type 2: for mu=[0..ng), s1=mu/Ns, s2=mu%Ns;
-//         tloop(s1,s2)(c1,c2) = Tr_spin( Gamma(g2[mu]) * loop )(c1,c2)
-void A2ALoopContractionType2(PropagatorField &tloop, const PropagatorField &loop,
-                                  const Vector<Gamma::Algebra> &gamma2)
-{
-  int ng = (int)gamma2.size();
-  const Gamma::Algebra *g2 = gamma2.data();
-  autoView(tloopv, tloop, AcceleratorWrite);
-  autoView(loopv,  loop,  AcceleratorRead);
-  uint64_t Osites = loop.Grid()->oSites();
-  int Nsimd = SpinColourMatrix_v::Nsimd();
-  accelerator_for(ss, Osites, Nsimd, {
-    auto l = loopv(ss);
-    auto tmp = l; tmp = Zero();
-    for (int mu = 0; mu < ng; ++mu) {
-      auto gtmp = Gamma(g2[mu]) * l;
-      int s1 = mu / Ns;
-      int s2 = mu % Ns;
-      for (int c1 = 0; c1 < Nc; ++c1)
-      for (int c2 = 0; c2 < Nc; ++c2)
-        tmp()(s1,s2)(c1,c2) = gtmp()(0,0)(c1,c2) + gtmp()(1,1)(c1,c2)
-                            + gtmp()(2,2)(c1,c2) + gtmp()(3,3)(c1,c2);
-    }
-    coalescedWrite(tloopv[ss], tmp);
-  });
-}
-
-// Type 3: colour-trace → spin matrix → sum_mu G1*spinLoop*G2 stored in (s1,s2)(0,0)
-void A2ALoopContractionType3(PropagatorField &tloop, const PropagatorField &loop,
-                                  const Vector<Gamma::Algebra> &gamma1,
-                                  const Vector<Gamma::Algebra> &gamma2)
-{
-  int ng = (int)gamma1.size();
-  const Gamma::Algebra *g1 = gamma1.data();
-  const Gamma::Algebra *g2 = gamma2.data();
-  autoView(tloopv, tloop, AcceleratorWrite);
-  autoView(loopv,  loop,  AcceleratorRead);
-  uint64_t Osites = loop.Grid()->oSites();
-  int Nsimd = SpinColourMatrix_v::Nsimd();
-  accelerator_for(ss, Osites, Nsimd, {
-    typedef decltype(coalescedRead(loopv[0])) calcSCMatrix;
-    typedef iSpinMatrix<typename calcSCMatrix::vector_type> calcSpinMatrix;
-    auto l = loopv(ss);
-    calcSpinMatrix spinLoop; spinLoop = Zero();
-    for (int s1 = 0; s1 < Ns; ++s1)
-    for (int s2 = 0; s2 < Ns; ++s2)
-      spinLoop()(s1,s2)() = l()(s1,s2)(0,0) + l()(s1,s2)(1,1) + l()(s1,s2)(2,2);
-    auto tmp = l; tmp = Zero();
-    for (int mu = 0; mu < ng; ++mu) {
-      calcSpinMatrix tmp2 = Gamma(g1[mu]) * spinLoop * Gamma(g2[mu]);
-      for (int s1 = 0; s1 < Ns; ++s1)
-      for (int s2 = 0; s2 < Ns; ++s2)
-        tmp()(s1,s2)(0,0) = tmp()(s1,s2)(0,0) + tmp2()(s1,s2)();
-    }
-    coalescedWrite(tloopv[ss], tmp);
-  });
-}
-
-// Type 0: loopRight = sum_mu Tr(G2*spinLoop) * G1*right
-//   where spinLoop(s1,s2) = tloop(s1,s2)(0,0)
-void A2ALoopRightContractionType0(FermionField &loopRight,
-                                   const PropagatorField &tloop,
-                                   const FermionField &right,
-                                   const Vector<Gamma::Algebra> &gamma1,
-                                   const Vector<Gamma::Algebra> &gamma2)
-{
-  int ng = (int)gamma1.size();
-  const Gamma::Algebra *g1 = gamma1.data();
-  const Gamma::Algebra *g2 = gamma2.data();
-  autoView(lRv, loopRight, AcceleratorWrite);
-  autoView(tlv, tloop,     AcceleratorRead);
-  autoView(rv,  right,     AcceleratorRead);
-  uint64_t Osites = right.Grid()->oSites();
-  int Nsimd = SpinColourVector_v::Nsimd();
-  accelerator_for(ss, Osites, Nsimd, {
-    typedef decltype(coalescedRead(rv[0]))  calcSCVector;
-    typedef decltype(coalescedRead(tlv[0])) calcSCMatrix;
-    typedef iSpinMatrix<typename calcSCMatrix::vector_type> calcSpinMatrix;
-    auto loopm  = tlv(ss);
-    auto rightv = rv(ss);
-    calcSpinMatrix spinLoop; spinLoop = Zero();
-    for (int s1 = 0; s1 < Ns; ++s1)
-    for (int s2 = 0; s2 < Ns; ++s2)
-      spinLoop()(s1,s2)() = loopm()(s1,s2)(0,0);
-    calcSCVector lR; lR = Zero();
-    for (int mu = 0; mu < ng; ++mu) {
-      auto GLoop   = Gamma(g2[mu]) * spinLoop;
-      auto trGLoop = GLoop()(0,0)() + GLoop()(1,1)() + GLoop()(2,2)() + GLoop()(3,3)();
-      auto Grightv = Gamma(g1[mu]) * rightv;
-      for (int s = 0; s < Ns; ++s)
-      for (int c = 0; c < Nc; ++c)
-        lR()(s)(c) = lR()(s)(c) + Grightv()(s)(c) * trGLoop;
-    }
-    coalescedWrite(lRv[ss], lR);
-  });
-}
-
-// Type 1: loopRight = tloop * right  (SpinColourMatrix * SpinColourVector)
-void A2ALoopRightContractionType1(FermionField &loopRight,
-                                   const PropagatorField &tloop,
-                                   const FermionField &right)
-{
-  autoView(lRv, loopRight, AcceleratorWrite);
-  autoView(tlv, tloop,     AcceleratorRead);
-  autoView(rv,  right,     AcceleratorRead);
-  uint64_t Osites = right.Grid()->oSites();
-  int Nsimd = SpinColourVector_v::Nsimd();
-  accelerator_for(ss, Osites, Nsimd, {
-    coalescedWrite(lRv[ss], tlv(ss) * rv(ss));
-  });
-}
-
-// Type 2: loopRight(s)(c) = sum_{mu,c'} tloop(s1,s2)(c,c') * (G(g1[mu])*right)(s)(c')
-void A2ALoopRightContractionType2(FermionField &loopRight,
-                                   const PropagatorField &tloop,
-                                   const FermionField &right,
-                                   const Vector<Gamma::Algebra> &gamma1)
-{
-  int ng = (int)gamma1.size();
-  const Gamma::Algebra *g1 = gamma1.data();
-  autoView(lRv, loopRight, AcceleratorWrite);
-  autoView(tlv, tloop,     AcceleratorRead);
-  autoView(rv,  right,     AcceleratorRead);
-  uint64_t Osites = right.Grid()->oSites();
-  int Nsimd = SpinColourVector_v::Nsimd();
-  accelerator_for(ss, Osites, Nsimd, {
-    typedef decltype(coalescedRead(rv[0])) calcSCVector;
-    auto loopm  = tlv(ss);
-    auto rightv = rv(ss);
-    calcSCVector lR; lR = Zero();
-    for (int mu = 0; mu < ng; ++mu) {
-      int s1 = mu / Ns;
-      int s2 = mu % Ns;
-      auto Grightv = Gamma(g1[mu]) * rightv;
-      for (int s = 0; s < Ns; ++s)
-      for (int c = 0; c < Nc; ++c)
-        lR()(s)(c) = lR()(s)(c)
-                   + loopm()(s1,s2)(c,0) * Grightv()(s)(0)
-                   + loopm()(s1,s2)(c,1) * Grightv()(s)(1)
-                   + loopm()(s1,s2)(c,2) * Grightv()(s)(2);
-    }
-    coalescedWrite(lRv[ss], lR);
-  });
-}
-
-// Type 3: loopRight(s)(c) = sum_{s'} tloop(s,s')(0,0) * right(s')(c)
-void A2ALoopRightContractionType3(FermionField &loopRight,
-                                   const PropagatorField &tloop,
-                                   const FermionField &right)
-{
-  autoView(lRv, loopRight, AcceleratorWrite);
-  autoView(tlv, tloop,     AcceleratorRead);
-  autoView(rv,  right,     AcceleratorRead);
-  uint64_t Osites = right.Grid()->oSites();
-  int Nsimd = SpinColourVector_v::Nsimd();
-  accelerator_for(ss, Osites, Nsimd, {
-    typedef decltype(coalescedRead(rv[0])) calcSCVector;
-    auto loopm  = tlv(ss);
-    auto rightv = rv(ss);
-    calcSCVector lR; lR = Zero();
-    for (int s = 0; s < Ns; ++s)
-    for (int c = 0; c < Nc; ++c)
-      lR()(s)(c) = loopm()(s,0)(0,0) * rightv()(0)(c)
-                 + loopm()(s,1)(0,0) * rightv()(1)(c)
-                 + loopm()(s,2)(0,0) * rightv()(2)(c)
-                 + loopm()(s,3)(0,0) * rightv()(3)(c);
-    coalescedWrite(lRv[ss], lR);
-  });
-}
-
-// ================================================================
-// GPU-offloaded extended meson field: accelerator_for contractions
-// + A2ASpatialSum GEMM spatial reduction.
-// ================================================================
-class A2AExtendedMesonFieldGPU
-{
-public:
-  static void compute(
-      Eigen::Tensor<ComplexD, 3> &result,
-      const std::vector<FermionField> &left,
-      const std::vector<FermionField> &right,
-      const std::vector<FermionField> &loop1,
-      const std::vector<FermionField> &loop2,
-      const std::vector<Gamma::Algebra> &gamma1_in,
-      const std::vector<Gamma::Algebra> &gamma2_in,
-      int type)
-  {
-    GridBase *grid = left[0].Grid();
-    int N_i = (int)left.size();
-    int N_j = (int)right.size();
-
-    std::string tag = std::string("[gpu  type=") + std::to_string(type) + "]";
-    auto Tms = [](double us) { return us * 1e-3; };
-    double t0;
-
-    Vector<Gamma::Algebra> gamma1(gamma1_in.begin(), gamma1_in.end());
-    Vector<Gamma::Algebra> gamma2(gamma2_in.begin(), gamma2_in.end());
-
-    t0 = usecond();
-    for (auto &f : loop1) { autoView(v, f, AcceleratorRead); }
-    for (auto &f : loop2) { autoView(v, f, AcceleratorRead); }
-    std::cout << GridLogMessage << tag << " view_open_loop:  " << Tms(usecond()-t0) << " ms\n";
-
-    t0 = usecond();
-    PropagatorField loop(grid);
-    A2ALoopPropagator(loop, loop1, loop2);
-    std::cout << GridLogMessage << tag << " loop_build:      " << Tms(usecond()-t0) << " ms\n";
-
-    t0 = usecond();
-    PropagatorField tloop(grid);
-    tloop = Zero();
-    switch (type) {
-    case 0: A2ALoopContractionType0(tloop, loop);                break;
-    case 1: A2ALoopContractionType1(tloop, loop, gamma1, gamma2); break;
-    case 2: A2ALoopContractionType2(tloop, loop, gamma2);         break;
-    case 3: A2ALoopContractionType3(tloop, loop, gamma1, gamma2); break;
-    }
-    std::cout << GridLogMessage << tag << " tloop:           " << Tms(usecond()-t0) << " ms\n";
-
-    t0 = usecond();
-    { autoView(tlv, tloop, AcceleratorRead); }
-    for (int j = 0; j < N_j; j++) { autoView(rv, right[j], AcceleratorRead); }
-    std::cout << GridLogMessage << tag << " view_open_right: " << Tms(usecond()-t0) << " ms\n";
-
-    t0 = usecond();
-    std::vector<FermionField> loopRight(N_j, grid);
-    for (int j = 0; j < N_j; j++) {
-      switch (type) {
-      case 0: A2ALoopRightContractionType0(loopRight[j], tloop, right[j], gamma1, gamma2); break;
-      case 1: A2ALoopRightContractionType1(loopRight[j], tloop, right[j]);                 break;
-      case 2: A2ALoopRightContractionType2(loopRight[j], tloop, right[j], gamma1);         break;
-      case 3: A2ALoopRightContractionType3(loopRight[j], tloop, right[j]);                 break;
-      }
-    }
-    std::cout << GridLogMessage << tag << " pack_loopright:  " << Tms(usecond()-t0) << " ms\n";
-
-    A2ASpatialSum<SpinColourVector_v> spatial_sum;
-    double t_blas = usecond();
-
-    t0 = usecond();
-    spatial_sum.Allocate(N_i, N_j, grid);
-    std::cout << GridLogMessage << tag << " Allocate:        " << Tms(usecond()-t0) << " ms\n";
-
-    t0 = usecond();
-    spatial_sum.PackLeftConj(left);
-    std::cout << GridLogMessage << tag << " PackLeftConj:    " << Tms(usecond()-t0) << " ms\n";
-
-    t0 = usecond();
-    spatial_sum.PackRight(loopRight);
-    std::cout << GridLogMessage << tag << " PackRight:       " << Tms(usecond()-t0) << " ms\n";
-
-    t0 = usecond();
-    spatial_sum.Sum(result);
-    std::cout << GridLogMessage << tag << " Sum (GEMM+MPI):  " << Tms(usecond()-t0) << " ms\n";
-
-    std::cout << GridLogMessage << tag << " A2ASpatialSum:   " << Tms(usecond()-t_blas) << " ms  [TOTAL]\n";
-  }
-};
 
 int main(int argc, char *argv[])
 {
@@ -760,7 +463,8 @@ int main(int argc, char *argv[])
   Eigen::Tensor<ComplexD, 3> result_ref(Nt, N_i, N_j);
   Eigen::Tensor<ComplexD, 3> result_blas(Nt, N_i, N_j);
   Eigen::Tensor<ComplexD, 3> result_gpu(Nt, N_i, N_j);
-  double t_ref = 0, t_blas = 0, t_gpu = 0, start, stop;
+  Eigen::Tensor<ComplexD, 3> result_gpu_ptr(Nt, N_i, N_j);
+  double t_ref = 0, t_blas = 0, t_gpu = 0, t_gpu_ptr = 0, start, stop;
 
   // Force GPU initialisation before any timed section to avoid corrupted type=0 timers.
   { int dummy = 0; accelerator_for(i, 1, 1, { (void)i; }); }
@@ -781,44 +485,63 @@ int main(int argc, char *argv[])
 
     result_gpu.setZero();
     start = usecond();
-    A2AExtendedMesonFieldGPU::compute(result_gpu, left, right, loop1, loop2,
-                                      GammaMU, GammaMU, type);
+    A2AExtendedMesonFieldKernels(result_gpu, left, right, loop1, loop2,
+                                 GammaMU, GammaMU, type, false);
     stop = usecond(); t_gpu = stop - start;
 
-    double norm2_ref = 0.0, norm2_blas = 0.0, norm2_gpu = 0.0;
-    double norm2_diff_blas = 0.0, norm2_diff_gpu = 0.0;
+    result_gpu_ptr.setZero();
+    start = usecond();
+    A2AExtendedMesonFieldKernels(result_gpu_ptr, left, right, loop1, loop2,
+                                 GammaMU, GammaMU, type, true);
+    stop = usecond(); t_gpu_ptr = stop - start;
+
+    double norm2_ref = 0.0, norm2_blas = 0.0, norm2_gpu = 0.0, norm2_gpu_ptr = 0.0;
+    double norm2_diff_blas = 0.0, norm2_diff_gpu = 0.0, norm2_diff_gpu_ptr = 0.0, norm2_diff_ptr_vs_gpu = 0.0;
     for (int t  = 0; t  < Nt;  t++)
     for (int ii = 0; ii < N_i; ii++)
     for (int jj = 0; jj < N_j; jj++) {
-      norm2_ref  += norm2(result_ref(t, ii, jj));
-      norm2_blas += norm2(result_blas(t, ii, jj));
-      norm2_gpu  += norm2(result_gpu(t, ii, jj));
-      ComplexD diff_blas = result_ref(t, ii, jj) - result_blas(t, ii, jj);
-      ComplexD diff_gpu  = result_ref(t, ii, jj) - result_gpu(t, ii, jj);
-      norm2_diff_blas += norm2(diff_blas);
-      norm2_diff_gpu  += norm2(diff_gpu);
+      norm2_ref     += norm2(result_ref(t, ii, jj));
+      norm2_blas    += norm2(result_blas(t, ii, jj));
+      norm2_gpu     += norm2(result_gpu(t, ii, jj));
+      norm2_gpu_ptr += norm2(result_gpu_ptr(t, ii, jj));
+      ComplexD diff_blas       = result_ref(t, ii, jj) - result_blas(t, ii, jj);
+      ComplexD diff_gpu        = result_ref(t, ii, jj) - result_gpu(t, ii, jj);
+      ComplexD diff_gpu_ptr    = result_ref(t, ii, jj) - result_gpu_ptr(t, ii, jj);
+      ComplexD diff_ptr_vs_gpu = result_gpu(t, ii, jj) - result_gpu_ptr(t, ii, jj);
+      norm2_diff_blas       += norm2(diff_blas);
+      norm2_diff_gpu        += norm2(diff_gpu);
+      norm2_diff_gpu_ptr    += norm2(diff_gpu_ptr);
+      norm2_diff_ptr_vs_gpu += norm2(diff_ptr_vs_gpu);
     }
 
-    double rel_blas = (norm2_ref > 0) ? std::sqrt(norm2_diff_blas / norm2_ref) : 0.0;
-    double rel_gpu  = (norm2_ref > 0) ? std::sqrt(norm2_diff_gpu  / norm2_ref) : 0.0;
+    double rel_blas       = (norm2_ref > 0) ? std::sqrt(norm2_diff_blas    / norm2_ref) : 0.0;
+    double rel_gpu        = (norm2_ref > 0) ? std::sqrt(norm2_diff_gpu     / norm2_ref) : 0.0;
+    double rel_gpu_ptr    = (norm2_ref > 0) ? std::sqrt(norm2_diff_gpu_ptr / norm2_ref) : 0.0;
+    double rel_ptr_vs_gpu = (norm2_gpu > 0) ? std::sqrt(norm2_diff_ptr_vs_gpu / norm2_gpu) : 0.0;
 
     std::cout << GridLogMessage
               << "type=" << type
-              << "  norm2_ref="  << norm2_ref
-              << "  norm2_blas=" << norm2_blas
-              << "  norm2_gpu="  << norm2_gpu
-              << "  rel_blas="   << rel_blas
-              << "  rel_gpu="    << rel_gpu
-              << "  t_ref="  << t_ref  * 1e-6 << "s"
-              << "  t_blas=" << t_blas * 1e-6 << "s"
-              << "  t_gpu="  << t_gpu  * 1e-6 << "s"
+              << "  norm2_ref="     << norm2_ref
+              << "  norm2_blas="    << norm2_blas
+              << "  norm2_gpu="     << norm2_gpu
+              << "  norm2_gpu_ptr=" << norm2_gpu_ptr
+              << "  rel_blas="       << rel_blas
+              << "  rel_gpu="        << rel_gpu
+              << "  rel_gpu_ptr="    << rel_gpu_ptr
+              << "  rel_ptr_vs_gpu=" << rel_ptr_vs_gpu
+              << "  t_ref="     << t_ref     * 1e-6 << "s"
+              << "  t_blas="    << t_blas    * 1e-6 << "s"
+              << "  t_gpu="     << t_gpu     * 1e-6 << "s"
+              << "  t_gpu_ptr=" << t_gpu_ptr * 1e-6 << "s"
               << std::endl;
 
-    GRID_ASSERT(rel_blas < 1e-10);
-    GRID_ASSERT(rel_gpu  < 1e-10);
+    GRID_ASSERT(rel_blas       < 1e-10);
+    GRID_ASSERT(rel_gpu        < 1e-10);
+    GRID_ASSERT(rel_gpu_ptr    < 1e-10);
+    GRID_ASSERT(rel_ptr_vs_gpu < 1e-14);
   }
 
-  std::cout << GridLogMessage << "All types passed A2ASpatialSum and GPU regression." << std::endl;
+  std::cout << GridLogMessage << "All types passed A2ASpatialSum, GPU, and LoopPropagatorPtr regression." << std::endl;
 
   Grid_finalize();
   return EXIT_SUCCESS;
