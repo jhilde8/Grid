@@ -32,6 +32,18 @@ Author: Christoph Lehner <christoph@lhnr.de>
 
 NAMESPACE_BEGIN(Grid);
 
+//////////////////////////////////////////////////////////////////////////////////////
+// norm2 below is instantiated on bare ComplexD/RealD, whose associated namespace is
+// thrust on an accelerator build (or none at all for RealD), so ADL cannot reach
+// these overloads at the point of instantiation. Declare them here so ordinary
+// unqualified lookup finds them at the template definition point; the definitions
+// stay below with the rest of the innerProductD family.
+//////////////////////////////////////////////////////////////////////////////////////
+accelerator_inline ComplexD innerProductD(const ComplexF &l,const ComplexF &r);
+accelerator_inline ComplexD innerProductD(const ComplexD &l,const ComplexD &r);
+accelerator_inline RealD    innerProductD(const RealD    &l,const RealD    &r);
+accelerator_inline RealD    innerProductD(const RealF    &l,const RealF    &r);
+
 ///////////////////////////////////////////////////////////////////////////////////////
 // innerProduct Scalar x Scalar -> Scalar
 // innerProduct Vector x Vector -> Scalar
