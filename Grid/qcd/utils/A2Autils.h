@@ -1658,13 +1658,29 @@ public:
   typedef iSpinMatrix<vector_type>       SpinMatrix_v;
 
   // ----------------------------------------------------------
-  // Kernel: loop propagator = sum_k outerProduct(loop1[k], loop2[k])
+  // Kernel: loop propagator, accumulating over a range of modes
+  //
+  //   loop += sum_{k=0}^{Nk-1} outerProduct(loop1[off1+k], loop2[off2+k])
+  //
+  // This accumulates rather than overwrites, so a full mode set is summed
+  // by calling it repeatedly; the caller owns zeroing loop beforehand (the
+  // three-argument overload below does that and sums the whole array).
+  // Independent left and right offsets let one call pair a compressed left
+  // array against a slice of a larger right array.
+  //
+  // Nk is how many field views are open simultaneously, so it is the knob
+  // that bounds device residency, independent of how many fields the caller
+  // happens to keep resident on the host.
   // ----------------------------------------------------------
   static void LoopPropagator(PropagatorField &loop,
-                              const std::vector<FermionField> &loop1,
-                              const std::vector<FermionField> &loop2)
+                              const std::vector<FermionField> &loop1, int off1,
+                              const std::vector<FermionField> &loop2, int off2,
+                              int Nk)
   {
-    int Nk          = (int)loop1.size();
+    if (Nk <= 0) return;
+    GRID_ASSERT(off1 >= 0 && off1 + Nk <= (int)loop1.size());
+    GRID_ASSERT(off2 >= 0 && off2 + Nk <= (int)loop2.size());
+
     uint64_t oSites = loop.Grid()->oSites();
     int Nsimd       = SpinColourVector_v::Nsimd();
 
@@ -1672,8 +1688,8 @@ public:
     std::vector<View> v1, v2;
     v1.reserve(Nk); v2.reserve(Nk);
     for (int k = 0; k < Nk; k++) {
-      v1.push_back(loop1[k].View(AcceleratorRead));
-      v2.push_back(loop2[k].View(AcceleratorRead));
+      v1.push_back(loop1[off1 + k].View(AcceleratorRead));
+      v2.push_back(loop2[off2 + k].View(AcceleratorRead));
     }
 
     deviceVector<SpinColourVector_v *> l1p(Nk), l2p(Nk);
@@ -1682,13 +1698,16 @@ public:
       acceleratorPut(l2p[k], &v2[k][0]);
     }
 
+    // AcceleratorWrite, not AcceleratorWriteDiscard: the existing contents
+    // must be cloned to the device so this call accumulates onto them
+    // instead of overwriting them.
     autoView(loopv, loop, AcceleratorWrite);
     SpinColourVector_v **l1 = &l1p[0];
     SpinColourVector_v **l2 = &l2p[0];
     int lNk = Nk;
     accelerator_for(ss, oSites, Nsimd, {
-      auto res = outerProduct(coalescedRead(l1[0][ss]), coalescedRead(l2[0][ss]));
-      for (int k = 1; k < lNk; k++)
+      auto res = coalescedRead(loopv[ss]);
+      for (int k = 0; k < lNk; k++)
         res = res + outerProduct(coalescedRead(l1[k][ss]), coalescedRead(l2[k][ss]));
       coalescedWrite(loopv[ss], res);
     });
@@ -1699,44 +1718,90 @@ public:
   }
 
   // ----------------------------------------------------------
-  // Same as LoopPropagator, but loop1/loop2 are already-built pointers
-  // (e.g. a slice of a larger resident array) rather than owned arrays.
+  // Whole-array form: loop = sum_k outerProduct(loop1[k], loop2[k]).
+  // Opens every mode's view at once, so device residency scales with
+  // loop1.size(); use the offset/Nk form above to bound it.
   // ----------------------------------------------------------
-  static void LoopPropagatorPtr(PropagatorField &loop,
-                                  const std::vector<const FermionField *> &loop1,
-                                  const std::vector<const FermionField *> &loop2)
+  static void LoopPropagator(PropagatorField &loop,
+                              const std::vector<FermionField> &loop1,
+                              const std::vector<FermionField> &loop2)
   {
-    int Nk          = (int)loop1.size();
-    uint64_t oSites = loop.Grid()->oSites();
-    int Nsimd       = SpinColourVector_v::Nsimd();
+    loop = Zero();
+    LoopPropagator(loop, loop1, 0, loop2, 0, (int)loop1.size());
+  }
 
-    typedef decltype(loop1[0]->View(AcceleratorRead)) View;
-    std::vector<View> v1, v2;
-    v1.reserve(Nk); v2.reserve(Nk);
-    for (int k = 0; k < Nk; k++) {
-      v1.push_back(loop1[k]->View(AcceleratorRead));
-      v2.push_back(loop2[k]->View(AcceleratorRead));
-    }
+  // ----------------------------------------------------------
+  // Time-slice gather ("stitch") that compresses the V side of a loop
+  // for pairing against dense, time-undiluted W.
+  //
+  // A dense W slot sc restricted to global timeslice t reproduces the
+  // fully expanded W mode t*Nsc + sc exactly, so a mode inner product
+  // only ever samples the expanded V mode t*Nsc + sc on timeslice t.
+  // This gathers precisely that surviving part: for source j the
+  // expanded index k = kStart + j gives t = k/Nsc and sc = k%Nsc, and
+  // global timeslice t of src[srcOff + j] is copied into dense[sc] at
+  // global timeslice t.
+  //
+  // Once every k in [0, nt*Nsc) has been passed - in one call, or across
+  // several, e.g. one per bin read from disk - dense[sc] is a complete
+  // field pairing index for index with dense W slot sc. Sites are only
+  // written, never accumulated, and a complete k range covers every site
+  // of dense[sc] exactly once, so no pre-zeroing is needed.
+  //
+  // The result is lossy and specific to this pairing: what is dropped
+  // from each source is exactly the part whose W partner vanishes. It is
+  // not a general A2A vector array and must not be reused as one.
+  //
+  // A rank owning none of a source's global timeslice skips it without
+  // launching a kernel. An outer site bundles Nsimd lattice points that
+  // may lie on different timeslices, so the copy has to go lane by lane;
+  // the coordinate decode follows A2ASpatialSum::PackVectors.
+  // ----------------------------------------------------------
+  static void GatherDenseTimeslices(std::vector<FermionField> &dense,
+                                    const std::vector<FermionField> &src,
+                                    int srcOff, int kStart, int kCount, int Nsc)
+  {
+    if (kCount <= 0) return;
+    GRID_ASSERT(srcOff >= 0 && srcOff + kCount <= (int)src.size());
+    GRID_ASSERT((int)dense.size() >= Nsc);
 
-    deviceVector<SpinColourVector_v *> l1p(Nk), l2p(Nk);
-    for (int k = 0; k < Nk; k++) {
-      acceleratorPut(l1p[k], &v1[k][0]);
-      acceleratorPut(l2p[k], &v2[k][0]);
-    }
+    GridBase *grid = dense[0].Grid();
+    int nd     = grid->_ndimension;
+    int osites = grid->oSites();
+    int Nsimd  = vobj::Nsimd();
 
-    autoView(loopv, loop, AcceleratorWrite);
-    SpinColourVector_v **l1 = &l1p[0];
-    SpinColourVector_v **l2 = &l2p[0];
-    int lNk = Nk;
-    accelerator_for(ss, oSites, Nsimd, {
-      auto res = outerProduct(coalescedRead(l1[0][ss]), coalescedRead(l2[0][ss]));
-      for (int k = 1; k < lNk; k++)
-        res = res + outerProduct(coalescedRead(l1[k][ss]), coalescedRead(l2[k][ss]));
-      coalescedWrite(loopv[ss], res);
-    });
-    for (int k = 0; k < Nk; k++) {
-      v1[k].ViewClose();
-      v2[k].ViewClose();
+    Coordinate rdimensions = grid->_rdimensions;
+    Coordinate simd        = grid->_simd_layout;
+
+    int tFirst = grid->LocalStarts()[nd - 1];
+    int tLocal = grid->LocalDimensions()[nd - 1];
+
+    for (int j = 0; j < kCount; j++) {
+      int k  = kStart + j;
+      int t  = k / Nsc;
+      int sc = k % Nsc;
+
+      if (t < tFirst || t >= tFirst + tLocal) continue;
+      int tl = t - tFirst;
+
+      autoView(src_v, src[srcOff + j], AcceleratorRead);
+      autoView(dst_v, dense[sc],       AcceleratorWrite);
+      accelerator_for(sf, osites, Nsimd, {
+#ifdef GRID_SIMT
+        {
+          int lane = acceleratorSIMTlane(Nsimd);
+#else
+          for (int lane = 0; lane < Nsimd; lane++) {
+#endif
+          Coordinate icoor(nd), ocoor(nd);
+          Lexicographic::CoorFromIndex(icoor, lane, simd);
+          Lexicographic::CoorFromIndex(ocoor, sf,   rdimensions);
+          if (rdimensions[nd - 1] * icoor[nd - 1] + ocoor[nd - 1] == tl) {
+            auto data = extractLane(lane, src_v[sf]);
+            insertLane(lane, dst_v[sf], data);
+          }
+        }
+      });
     }
   }
 
