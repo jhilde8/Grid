@@ -26,6 +26,7 @@ Author: Peter Boyle <pboyle@bnl.gov>
 //   T2 cartesian ring == GlobalSumVector, same sweep
 //   T3 bitwise repeatable (deterministic order)
 //   T4 timing at 16 MB, both rings vs GlobalSumVector
+//   T5 CartesianRingAllGather bitwise == padded GlobalSumVector; timing at the dense-apply shape
 //
 //   mpirun -n 4 ./Test_ring_allreduce --grid 16.16.16.32 --mpi 1.1.2.2
 // (2D process grid so the cartesian variant exercises more than one ring)
@@ -100,6 +101,54 @@ int main(int argc, char **argv)
   Check<ComplexD>("ComplexD", grid, 1.0e-13);
   Check<RealF>   ("RealF   ", grid, 1.0e-5);
   Check<ComplexF>("ComplexF", grid, 1.0e-5);
+
+  // T5: CartesianRingAllGather delivers blocks in LEX-coordinate order; the
+  // reference is the zero-padded GlobalSumVector in RANK order, compared
+  // through the lex->rank table (bitwise: no arithmetic on either path).
+  // On a machine where ranks are relabelled (Frontier OptimalCommunicator)
+  // this is the test that catches a rank/coordinate confusion.
+  {
+    int P=grid->ProcessorCount(), me=grid->ThisRank(), mylex=CartesianLexIndex(grid);
+    std::vector<int> l2r(P);
+    for(int lp=0; lp<P; lp++){ Coordinate pc(grid->_ndimension); Lexicographic::CoorFromIndex(pc, lp, grid->_processors); l2r[lp]=grid->RankFromProcessorCoor(pc); }
+    Report("T5 lex->rank table consistent for my rank", l2r[mylex]==me);
+    int perm=0; for(int lp=0;lp<P;lp++) if(l2r[lp]!=lp) perm=1;
+    std::cout << GridLogMessage << "  (ranks " << (perm ? "ARE" : "are not") << " permuted relative to lex coordinates on this run)" << std::endl;
+    for(uint64_t chunk : std::vector<uint64_t>({1,3,64,1000,65537})){
+      uint64_t n=chunk*P;
+      std::vector<ComplexD> h(n,ComplexD(0.0,0.0)), ref;
+      for(uint64_t i=0;i<chunk;i++) h[me*chunk+i]=Fill<ComplexD>(me*chunk+i,me);   // rank-order reference
+      ref=h; grid->GlobalSumVector(&ref[0],(int)n);
+      std::vector<ComplexD> hin(n,ComplexD(0.0,0.0));
+      for(uint64_t i=0;i<chunk;i++) hin[mylex*chunk+i]=h[me*chunk+i];              // my slot is my lex index
+      deviceVector<ComplexD> d(n); acceleratorCopyToDevice(&hin[0],&d[0],n*sizeof(ComplexD));
+      CartesianRingAllGather(grid,&d[0],chunk);
+      std::vector<ComplexD> out(n); acceleratorCopyFromDevice(&d[0],&out[0],n*sizeof(ComplexD));
+      int bad=0; for(int lp=0;lp<P;lp++) if(memcmp(&out[lp*chunk],&ref[(uint64_t)l2r[lp]*chunk],chunk*sizeof(ComplexD))!=0) bad=1;
+      RealD diff=bad; grid->GlobalSum(diff);
+      Report("T5 CartesianRingAllGather (lex blocks) bitwise == rank-order padded GlobalSumVector, ComplexD chunk="+std::to_string(chunk), diff==0.0);
+    }
+    { uint64_t chunk=1001, n=chunk*P;
+      std::vector<ComplexF> h(n,ComplexF(0.0,0.0)), ref;
+      for(uint64_t i=0;i<chunk;i++) h[me*chunk+i]=Fill<ComplexF>(me*chunk+i,me);
+      ref=h; grid->GlobalSumVector(&ref[0],(int)n);
+      std::vector<ComplexF> hin(n,ComplexF(0.0,0.0)); for(uint64_t i=0;i<chunk;i++) hin[mylex*chunk+i]=h[me*chunk+i];
+      deviceVector<ComplexF> d(n); acceleratorCopyToDevice(&hin[0],&d[0],n*sizeof(ComplexF));
+      CartesianRingAllGather(grid,&d[0],chunk);
+      std::vector<ComplexF> out(n); acceleratorCopyFromDevice(&d[0],&out[0],n*sizeof(ComplexF));
+      int bad=0; for(int lp=0;lp<P;lp++) if(memcmp(&out[lp*chunk],&ref[(uint64_t)l2r[lp]*chunk],chunk*sizeof(ComplexF))!=0) bad=1;
+      RealD diff=bad; grid->GlobalSum(diff);
+      Report("T5 CartesianRingAllGather bitwise, ComplexF chunk=1001", diff==0.0);
+    }
+    // timing: the dense-apply shape, N=138240 x 4 rhs of ComplexF, chunk = N*4/P
+    { uint64_t chunk=(uint64_t)138240*4/P, n=chunk*P;
+      deviceVector<ComplexF> d(n); std::vector<ComplexF> h(n,ComplexF(1.0,0.0)); acceleratorCopyToDevice(&h[0],&d[0],n*sizeof(ComplexF));
+      double t0=usecond(); CartesianRingAllGather(grid,&d[0],chunk); double t1=usecond();
+      acceleratorCopyToDevice(&h[0],&d[0],n*sizeof(ComplexF));
+      double t2=usecond(); CartesianRingAllReduce(grid,&d[0],n); double t3=usecond();
+      std::cout << GridLogMessage << "T5 timing N=138240 x 4 ComplexF (" << n*8/1.0e6 << " MB): allgather " << (t1-t0)/1000. << " ms, cartesian allreduce " << (t3-t2)/1000. << " ms" << std::endl;
+    }
+  }
 
   // T4 timing at 16 MB of ComplexF (the dense-apply size at 12 RHS is 13.3 MB)
   {
