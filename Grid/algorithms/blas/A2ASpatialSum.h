@@ -104,6 +104,24 @@ public:
   deviceVector<scalar *> LR_mom_ptrs;
   deviceVector<scalar *> EMF_mom_ptrs;
 
+  // GSV staging for the Device and Ring variants below. tile_buf holds one
+  // cacheBlock tile at full nt_global extent; tile_host is the host landing
+  // buffer for the reduced tile. Sized lazily rather than in Allocate,
+  // because nt_global and cacheBlock are only known at the call site.
+  deviceVector<scalar>   tile_buf;
+  std::vector<scalar>    tile_host;
+
+  // Working buffers for the Ring variant's reductions. RingAllReduceCore
+  // takes work and scratch as parameters precisely so they can be hoisted;
+  // the RingAllReduce / CartesianRingAllReduce convenience wrappers
+  // allocate them per call (and CartesianRingAllReduce once per dimension).
+  // MemoryManager pools same-size device allocations, so that is cheaper
+  // than it sounds, but the pool is only Ncache[Acc]=8 deep, shared with
+  // the rest of the application, and Ncache[AccHuge]=0 -- so hoisting is
+  // cheap insurance for a loop that runs once per cacheBlock tile.
+  deviceVector<scalar>   ring_work;
+  deviceVector<scalar>   ring_scratch;
+
   A2ASpatialSum() : grid(nullptr), N_i(0), N_j(0), nt(0), nxyz(0), Nsc(0), nmom(1) {}
 
   void Allocate(int _N_i, int _N_j, GridBase *_grid)
@@ -796,6 +814,475 @@ public:
         dt += usecond();
         if (timings) (*timings)[4] += dt;
         if (bytesMoved) (*bytesMoved)[4] += 2.0 * nt_global * Niii * Njjj * lnmom * sizeof(scalar);
+      }
+    }
+  }
+
+  // Device-resident variant of SumAllMomentaCacheBlocked. Identical GEMM,
+  // identical tiling, identical result layout and identical numerical
+  // content -- it exists as a separate function purely so the host path
+  // above stays available as an exact regression target. The two differ
+  // only in where the post-GEMM work happens:
+  //
+  //   SumAllMomentaCacheBlocked        SumAllMomentaCacheBlockedDevice
+  //   ---------------------------      -------------------------------
+  //   copy whole GEMM output to host   (nothing)
+  //   per tile: fill on host           per tile: fill on device
+  //             reduce on host                   reduce on device
+  //             scatter to result                copy tile to host
+  //                                              scatter to result
+  //
+  // The host copy therefore moves to the far side of the reduction, and
+  // grows: it used to carry the local slab (nt) once per call, and now
+  // carries the reduced tile at nt_global extent, so the total bytes are
+  // larger by the number of ranks in the time direction. That is still a
+  // good trade because host-device bandwidth sits far above the achievable
+  // rate of the collective, but it is the reason this is not a pure win on
+  // paper and has to be measured.
+  //
+  // timings[] and bytesMoved[] keep the slot meanings documented above
+  // Sum(), with timings[1] reinterpreted as that post-reduction copy.
+  //
+  // CACHEBLOCK CEILING. This hands a device pointer to GlobalSumVector, and
+  // Cray MPICH aborts on device-buffer MPI_Allreduce above roughly 8 MB
+  // (see RingAllReduce.h, which measured 4.4 MB passing and 13.3 MB
+  // failing). The message here is nt_global*cacheBlock^2*nmom*sizeof(scalar),
+  // so cacheBlock must satisfy nt_global*cacheBlock^2*nmom < 524288 for
+  // ComplexD -- about 63 at nt_global=128, nmom=1, and about 12 at nmom=27.
+  // Above that this dies inside MPI rather than returning a wrong answer.
+  // The Ring variant below has no such limit, being point-to-point
+  // throughout; this one is kept as the isolated device-migration
+  // measurement, so it deliberately does not change the collective.
+  template <int Layout = Eigen::ColMajor>
+  void SumAllMomentaCacheBlockedDevice(Eigen::Tensor<ComplexD, 4, Layout> &result,
+                                       int cacheBlock,
+                                       std::array<double, 5> *timings = nullptr,
+                                       std::array<double, 5> *bytesMoved = nullptr)
+  {
+    GridBLAS BLAS;
+    double dt;
+
+    int K     = nxyz * Nsc;
+    int Nwide = nmom * N_j;
+
+    dt = -usecond();
+    BLAS.gemmBatched(GridBLAS_OP_T, GridBLAS_OP_N,
+                     N_i, Nwide, K,
+                     scalar(1.0),
+                     W_ptrs,
+                     LR_mom_ptrs,
+                     scalar(0.0),
+                     EMF_mom_ptrs);
+    BLAS.synchronise();
+    dt += usecond();
+    if (timings) (*timings)[0] += dt;
+
+    int nt_global = result.dimension(0);
+    int nd        = grid->Nd();
+    int lt_start  = grid->LocalStarts()[nd - 1];
+
+    size_t tileMax = (size_t)nt_global * cacheBlock * cacheBlock * nmom;
+    if (tile_buf.size()  < tileMax) tile_buf.resize(tileMax);
+    if (tile_host.size() < tileMax) tile_host.resize(tileMax);
+
+    const scalar *emf_p  = &EMF_mom_buf[0];
+    scalar       *tile_p = &tile_buf[0];
+
+    int lN_i = N_i, lN_j = N_j, lnmom = nmom, lnt = nt, llt_start = lt_start;
+    for (int ii = 0; ii < N_i; ii += cacheBlock)
+    {
+      int Niii = std::min(N_i - ii, cacheBlock);
+      for (int jj = 0; jj < N_j; jj += cacheBlock)
+      {
+        int Njjj = std::min(N_j - jj, cacheBlock);
+
+        size_t tileWords = (size_t)nt_global * Niii * Njjj * nmom;
+        int    lNiii = Niii, lNjjj = Njjj, lii = ii, ljj = jj;
+
+        // One kernel does both the zero-pad and the gather from the GEMM
+        // output. idx runs over the full nt_global tile in exactly the
+        // tile's own index order, so the destination is idx itself
+        // (contiguous, coalesced) and timeslices outside this rank's slab
+        // simply get zero. That folds the host version's zero-fill and fill
+        // into a single pass, and reads EMF_mom_buf in place on the device
+        // rather than through a host copy.
+        dt = -usecond();
+        accelerator_for(idx, tileWords, 1, {
+            uint64_t r   = idx;
+            int      m   = r % lnmom;  r /= lnmom;
+            int      jjj = r % lNjjj;  r /= lNjjj;
+            int      iii = r % lNiii;  r /= lNiii;
+            int      lt  = (int)r - llt_start;
+            scalar   v   = scalar(0.0);
+            if ((lt >= 0) && (lt < lnt)) {
+              v = emf_p[(uint64_t)lt * lnmom * lN_j * lN_i
+                        + (uint64_t)(m * lN_j + (ljj + jjj)) * lN_i
+                        + (lii + iii)];
+            }
+            tile_p[idx] = v;
+        });
+        dt += usecond();
+        if (timings) (*timings)[2] += dt;
+        if (bytesMoved) (*bytesMoved)[2] += (double)(nt + nt_global) * Niii * Njjj * lnmom * sizeof(scalar);
+
+#ifdef ACCELERATOR_AWARE_MPI
+        dt = -usecond();
+        grid->GlobalSumVector(tile_p, (int)tileWords);
+        dt += usecond();
+        if (timings) (*timings)[3] += dt;
+
+        dt = -usecond();
+        acceleratorCopyFromDevice(tile_p, tile_host.data(), tileWords * sizeof(scalar));
+        dt += usecond();
+        if (timings) (*timings)[1] += dt;
+#else
+        // Host bounce: this MPI will not take a device pointer, so stage
+        // the tile down first and reduce the host copy instead. Same single
+        // copy and same byte count as the path above -- only the order of
+        // the two operations differs -- so timings[1] and timings[3] stay
+        // directly comparable between the two.
+        dt = -usecond();
+        acceleratorCopyFromDevice(tile_p, tile_host.data(), tileWords * sizeof(scalar));
+        dt += usecond();
+        if (timings) (*timings)[1] += dt;
+
+        dt = -usecond();
+        grid->GlobalSumVector(tile_host.data(), (int)tileWords);
+        dt += usecond();
+        if (timings) (*timings)[3] += dt;
+#endif
+        if (bytesMoved) (*bytesMoved)[1] += (double)tileWords * sizeof(scalar);
+        if (bytesMoved) (*bytesMoved)[3] += (double)tileWords * sizeof(scalar);
+
+        const scalar *red_p = tile_host.data();
+        dt = -usecond();
+        thread_for_collapse(4, gt, nt_global, {
+            for (int iii = 0; iii < Niii; iii++)
+            for (int jjj = 0; jjj < Njjj; jjj++)
+            for (int m = 0; m < lnmom; m++)
+              result((int)gt, ii + iii, jj + jjj, m)
+                  = red_p[((size_t)gt * Niii * Njjj + iii * Njjj + jjj) * lnmom + m];
+        });
+        dt += usecond();
+        if (timings) (*timings)[4] += dt;
+        if (bytesMoved) (*bytesMoved)[4] += 2.0 * nt_global * Niii * Njjj * lnmom * sizeof(scalar);
+      }
+    }
+  }
+
+  // Reduce over the spatial process axes only, leaving the time axis
+  // untouched. This is CartesianRingAllReduce's loop with d == Nd-1 skipped
+  // and the work/scratch buffers hoisted, which is why it calls
+  // RingAllReduceCore directly instead of the convenience wrapper.
+  //
+  // No sub-communicator is involved. ShiftedRanks gives the neighbours
+  // along one process axis of the parent Cartesian communicator, so ringing
+  // x then y then z reduces over exactly the P_xyz ranks that share this
+  // rank's t coordinate -- which is the set holding partial K sums of the
+  // same elements. Dimension-wise moves roughly 2n per axis against 2n
+  // total for a flat ring on a spatial sub-communicator, but every step is
+  // a neighbour link and there is no communicator to build, split or free.
+  // Local copy of RingAllReduceCore with both point-to-point exchanges
+  // moved off MPI_Sendrecv onto SendToRecvFromBegin/CommsComplete, for the
+  // reason documented above TemporalRingGather. Kept here rather than
+  // patched into RingAllReduce.h so a merge from develop cannot silently
+  // revert it; if the change is taken upstream, delete this and call
+  // RingAllReduceCore directly.
+  //
+  // Otherwise identical to the original: a reduce-scatter over P-1 steps
+  // leaving rank me owning fully reduced chunk (me+1)%P, then an all-gather
+  // circulating those chunks. work holds P*c elements, scratch holds c.
+  //
+  // Tags are constants rather than the step index. Each exchange is
+  // completed before the next begins, so at most one send and one receive
+  // are ever outstanding, and MPI orders messages within a given
+  // (source, dest, tag, communicator) tuple -- so steps cannot overtake one
+  // another. Constants also keep the value well clear of 32, above which it
+  // would collide with the rank term in SendToRecvFromBegin's
+  // tag = dir + rank*32.
+  void RingAllReduceCoreP2P(scalar *work, scalar *scratch,
+                            uint64_t c, int P, int me, int next, int prev)
+  {
+    if (P == 1) return;
+    uint64_t bytes = c * sizeof(scalar);
+
+    // Reduce-scatter. Receives into scratch, a separate allocation, so this
+    // phase never had the same-buffer exposure the all-gather below does.
+    for (int s = 0; s < P - 1; s++) {
+      int sendc = (me - s     + 2 * P) % P;
+      int recvc = (me - s - 1 + 2 * P) % P;
+      std::vector<MpiCommsRequest_t> reqs;
+      grid->SendToRecvFromBegin(reqs, (void *)&work[sendc * c], next,
+                                      (void *)scratch,          prev, bytes, 0);
+      grid->CommsComplete(reqs);
+      scalar *dst = &work[recvc * c];
+      accelerator_for(i, c, 1, { dst[i] = dst[i] + scratch[i]; });
+    }
+
+    // All-gather. Sends and receives into the same allocation at different
+    // offsets -- the shape the aliasing note is about.
+    for (int s = 0; s < P - 1; s++) {
+      int sendc = (me - s + 1 + 2 * P) % P;
+      int recvc = (me - s     + 2 * P) % P;
+      std::vector<MpiCommsRequest_t> reqs;
+      grid->SendToRecvFromBegin(reqs, (void *)&work[sendc * c], next,
+                                      (void *)&work[recvc * c], prev, bytes, 1);
+      grid->CommsComplete(reqs);
+    }
+  }
+
+  void SpatialRingReduce(scalar *buf, uint64_t n)
+  {
+    int nd_ = grid->Nd();
+    for (int d = 0; d < nd_ - 1; d++)
+    {
+      int P = grid->ProcessorGrid()[d];
+      if (P == 1) continue;
+
+      int me = grid->ThisProcessorCoor()[d];
+      int next, prev;
+      grid->ShiftedRanks(d, 1, prev, next);   // (dim, shift, source, dest)
+
+      uint64_t c = (n + P - 1) / P;
+      GRID_ASSERT(ring_work.size()    >= c * P);
+      GRID_ASSERT(ring_scratch.size() >= c);
+
+      scalar *w = &ring_work[0];
+      scalar *s = &ring_scratch[0];
+
+      // n is not generally a multiple of P, so the tail of the c*P working
+      // copy has to be zeroed or the padding chunks contribute garbage.
+      accelerator_for(i, c * P, 1, { w[i] = scalar(0.0); });
+      acceleratorCopyDeviceToDevice((void *)buf, (void *)w, n * sizeof(scalar));
+      RingAllReduceCoreP2P(w, s, c, P, me, next, prev);
+      acceleratorCopyDeviceToDevice((void *)w, (void *)buf, n * sizeof(scalar));
+    }
+  }
+
+  // All-gather half of the ring only. After SpatialRingReduce every slab is
+  // final, so nothing here combines values -- each step forwards the slot
+  // filled by the previous one, and after Pt-1 steps the panel is complete
+  // on every rank.
+  //
+  // The slot indices differ by one from RingAllReduceCore's all-gather
+  // loop: there the preceding reduce-scatter leaves rank me owning chunk
+  // (me+1)%P, whereas here each rank starts out already owning the slot for
+  // its own t coordinate.
+  // Deliberately uses SendToRecvFromBegin/CommsComplete (MPI_Irecv +
+  // MPI_Isend + waitall) rather than SendToRecvFrom, which is a bare
+  // MPI_Sendrecv (Communicator_mpi3.cc). skills/mpi-heterogeneous.md
+  // documents device-buffer aliasing in MPI_Sendrecv -- the library can
+  // reuse GPU addresses for internal staging without device memory
+  // ordering, corrupting data when the same pages appear on both paths --
+  // and names asynchronous send/receive pairs as the workaround. Every step
+  // here sends and receives into the same allocation at different offsets,
+  // which is exactly the exposed pattern, so take the documented route. The
+  // reported case is MPICH #7302 on Aurora rather than Frontier, but the
+  // alternative is already in Grid's API and costs nothing.
+  //
+  // Note RingAllReduceCore's own all-gather phase has the same exposure
+  // (it sends and receives into `work` at different offsets via
+  // SendToRecvFrom); worth raising upstream rather than working around
+  // here.
+  void TemporalRingGather(scalar *panel, uint64_t slabWords, int ct, int Pt)
+  {
+    // SendToRecvFromBegin asserts dest != _processor and from != _processor,
+    // so a single rank in time has to skip the loop rather than degenerate
+    // into a self-send.
+    if (Pt <= 1) return;
+
+    int nd_ = grid->Nd();
+    int next, prev;
+    grid->ShiftedRanks(nd_ - 1, 1, prev, next);
+
+    for (int s = 0; s < Pt - 1; s++) {
+      int sendslot = (ct - s     + 2 * Pt) % Pt;
+      int recvslot = (ct - s - 1 + 2 * Pt) % Pt;
+      // Constant tag, for the reason given above RingAllReduceCoreP2P: one
+      // exchange outstanding at a time plus MPI's per-tuple ordering makes
+      // the step index unnecessary, and keeps the value clear of the rank
+      // term in tag = dir + rank*32.
+      std::vector<MpiCommsRequest_t> reqs;
+      grid->SendToRecvFromBegin(reqs,
+                                (void *)(panel + (uint64_t)sendslot * slabWords), next,
+                                (void *)(panel + (uint64_t)recvslot * slabWords), prev,
+                                slabWords * sizeof(scalar), 2);
+      grid->CommsComplete(reqs);
+    }
+  }
+
+  // Split-collective variant: the single padded GlobalSumVector of the
+  // other Sum* functions is replaced by the two operations it was standing
+  // in for, each done with the primitive that matches it.
+  //
+  // Post-GEMM this rank's result is incomplete in two independent ways. It
+  // is incomplete in K, because the GEMM contracted only over this rank's
+  // own spatial sites -- every rank sharing this t coordinate holds a
+  // partial sum of the same element, and those must genuinely be added. It
+  // is incomplete in t, because the GEMM has only nt local batch elements
+  // -- the other timeslices exist on other ranks and only need to be moved,
+  // never summed. The padded allreduce did both at once by making addition
+  // impersonate concatenation, and paid reduction cost on nt_global when
+  // only nt_local carried information.
+  //
+  //   SpatialRingReduce    incomplete in K   arithmetic, P_xyz ranks,
+  //                                          slab sized (nt local)
+  //   TemporalRingGather   incomplete in t   movement, P_t ranks,
+  //                                          no arithmetic at all
+  //
+  // The order is forced: the gather only relays, so it is legal only once
+  // every slab is final, which is what the reduce establishes.
+  //
+  // Both run on point-to-point SendToRecvFrom rather than MPI collectives,
+  // which also sidesteps the device-buffer MPI_Allreduce size cliff
+  // documented in RingAllReduce.h. As that header assumes, an accelerator
+  // build needs ACCELERATOR_AWARE_MPI here: the rings hand the working
+  // buffers to both MPI and accelerator_for, so there is no host-bounce
+  // path to fall back to.
+  //
+  // GEMM OPERANDS ARE SWAPPED relative to the other Sum* variants -- LR is
+  // A and W is B, with M and N exchanged. Same flops, same K, same nt batch
+  // elements, same numbers; only the storage orientation of each batch's
+  // output changes, from C[i + col*N_i] (i fastest, layout [m][j][i]) to
+  // C[row + i*Nwide] (j fastest, layout [i][m][j]). That turns what was a
+  // full reversal into a contiguous-run gather.
+  //
+  // RESULT LAYOUT DIFFERS from SumAllMomentaCacheBlocked: this takes
+  // result[nt_global][N_i][nmom][N_j], nmom BEFORE N_j rather than after.
+  // That is what lets the tile agree with the swapped GEMM and with a
+  // RowMajor result simultaneously, so the scatter stays contiguous on both
+  // sides -- the property the nmom-last ordering was chosen for, preserved
+  // under the new orientation. It also makes the Hadrons IO fill loop
+  // contiguous, since that reads at fixed m and previously strided by nmom.
+  // The on-disk HDF5 layout is unaffected either way.
+  //
+  // timings[]/bytesMoved[] carry six slots here rather than five:
+  //   [0] GEMM              [1] device->host
+  //   [2] gather to slab    [3] spatial reduce
+  //   [4] scatter           [5] temporal gather
+  template <int Layout = Eigen::ColMajor>
+  void SumAllMomentaCacheBlockedRing(Eigen::Tensor<ComplexD, 4, Layout> &result,
+                                     int cacheBlock,
+                                     std::array<double, 6> *timings = nullptr,
+                                     std::array<double, 6> *bytesMoved = nullptr)
+  {
+    GridBLAS BLAS;
+    double dt;
+
+    int K     = nxyz * Nsc;
+    int Nwide = nmom * N_j;
+
+    dt = -usecond();
+    BLAS.gemmBatched(GridBLAS_OP_T, GridBLAS_OP_N,
+                     Nwide, N_i, K,
+                     scalar(1.0),
+                     LR_mom_ptrs,
+                     W_ptrs,
+                     scalar(0.0),
+                     EMF_mom_ptrs);
+    BLAS.synchronise();
+    dt += usecond();
+    if (timings) (*timings)[0] += dt;
+
+    int nt_global = result.dimension(0);
+    int nd        = grid->Nd();
+    int ct        = grid->ThisProcessorCoor()[nd - 1];
+    int Pt        = grid->ProcessorGrid()[nd - 1];
+
+    // Everything below indexes slabs by t coordinate, so the slab a rank
+    // owns must sit at slot ct. A permuted rank ordering would not fail
+    // here, it would silently produce a transposed time axis, so check it
+    // rather than trust it.
+    GRID_ASSERT(grid->LocalStarts()[nd - 1] == ct * nt);
+    GRID_ASSERT(nt_global == Pt * nt);
+
+    uint64_t slabMax = (uint64_t)nt * cacheBlock * nmom * cacheBlock;
+    size_t   tileMax = (size_t)nt_global * cacheBlock * cacheBlock * nmom;
+    int      maxP    = 1;
+    for (int d = 0; d < nd - 1; d++)
+      maxP = std::max(maxP, grid->ProcessorGrid()[d]);
+
+    // c*P for the ring is at most n + P - 1; scratch is c, bounded above by
+    // n itself, which costs little at tile size and avoids re-deriving the
+    // bound per dimension.
+    if (ring_work.size()    < slabMax + maxP) ring_work.resize(slabMax + maxP);
+    if (ring_scratch.size() < slabMax)        ring_scratch.resize(slabMax);
+    if (tile_buf.size()     < tileMax)        tile_buf.resize(tileMax);
+    if (tile_host.size()    < tileMax)        tile_host.resize(tileMax);
+
+    const scalar *emf_p  = &EMF_mom_buf[0];
+    scalar       *tile_p = &tile_buf[0];
+
+    int lN_i = N_i, lN_j = N_j, lnmom = nmom;
+    for (int ii = 0; ii < N_i; ii += cacheBlock)
+    {
+      int Niii = std::min(N_i - ii, cacheBlock);
+      for (int jj = 0; jj < N_j; jj += cacheBlock)
+      {
+        int Njjj = std::min(N_j - jj, cacheBlock);
+        int lNiii = Niii, lNjjj = Njjj, lii = ii, ljj = jj;
+
+        // Panel of Pt slots, slot k holding the timeslices owned by t
+        // coordinate k, laid out [gt][iii][m][jjj] with jjj fastest. gt is
+        // the slowest index, so this rank's nt timeslices form one
+        // contiguous run -- which is what lets the gather treat tile_buf as
+        // a panel of equal slots with no repacking.
+        uint64_t slabWords = (uint64_t)nt        * Niii * nmom * Njjj;
+        uint64_t tileWords = (uint64_t)nt_global * Niii * nmom * Njjj;
+        scalar  *slab_p    = tile_p + (uint64_t)ct * slabWords;
+
+        // No zero-pad and no transpose: the swapped GEMM already emits
+        // [i][m][j], so this walks contiguous runs of Njjj on both sides.
+        // When cacheBlock spans the whole block it degenerates to a
+        // straight copy, and EMF_ptrs could then be aimed at slab_p to drop
+        // it entirely -- left for later so this stays correct for the
+        // partial-tile case that CPU callers still want.
+        dt = -usecond();
+        accelerator_for(idx, slabWords, 1, {
+            uint64_t r   = idx;
+            int      jjj = r % lNjjj;  r /= lNjjj;
+            int      m   = r % lnmom;  r /= lnmom;
+            int      iii = r % lNiii;  r /= lNiii;
+            int      lt  = (int)r;
+            slab_p[idx] = emf_p[(uint64_t)lt * lN_i * lnmom * lN_j
+                              + (uint64_t)(lii + iii) * lnmom * lN_j
+                              + (uint64_t)m * lN_j
+                              + (ljj + jjj)];
+        });
+        dt += usecond();
+        if (timings) (*timings)[2] += dt;
+        if (bytesMoved) (*bytesMoved)[2] += 2.0 * slabWords * sizeof(scalar);
+
+        dt = -usecond();
+        SpatialRingReduce(slab_p, slabWords);
+        dt += usecond();
+        if (timings) (*timings)[3] += dt;
+        if (bytesMoved) (*bytesMoved)[3] += (double)slabWords * sizeof(scalar);
+
+        dt = -usecond();
+        TemporalRingGather(tile_p, slabWords, ct, Pt);
+        dt += usecond();
+        if (timings) (*timings)[5] += dt;
+        if (bytesMoved) (*bytesMoved)[5] += (double)(Pt - 1) * slabWords * sizeof(scalar);
+
+        dt = -usecond();
+        acceleratorCopyFromDevice(tile_p, tile_host.data(), tileWords * sizeof(scalar));
+        dt += usecond();
+        if (timings) (*timings)[1] += dt;
+        if (bytesMoved) (*bytesMoved)[1] += (double)tileWords * sizeof(scalar);
+
+        const scalar *red_p = tile_host.data();
+        dt = -usecond();
+        thread_for_collapse(4, gt, nt_global, {
+            for (int iii = 0; iii < Niii; iii++)
+            for (int m   = 0; m   < lnmom; m++)
+            for (int jjj = 0; jjj < Njjj; jjj++)
+              result((int)gt, ii + iii, m, jj + jjj)
+                  = red_p[(((uint64_t)gt * Niii + iii) * lnmom + m) * Njjj + jjj];
+        });
+        dt += usecond();
+        if (timings) (*timings)[4] += dt;
+        if (bytesMoved) (*bytesMoved)[4] += 2.0 * tileWords * sizeof(scalar);
       }
     }
   }
