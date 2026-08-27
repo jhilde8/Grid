@@ -111,17 +111,6 @@ public:
   deviceVector<scalar>   tile_buf;
   std::vector<scalar>    tile_host;
 
-  // Working buffers for the Ring variant's reductions. RingAllReduceCore
-  // takes work and scratch as parameters precisely so they can be hoisted;
-  // the RingAllReduce / CartesianRingAllReduce convenience wrappers
-  // allocate them per call (and CartesianRingAllReduce once per dimension).
-  // MemoryManager pools same-size device allocations, so that is cheaper
-  // than it sounds, but the pool is only Ncache[Acc]=8 deep, shared with
-  // the rest of the application, and Ncache[AccHuge]=0 -- so hoisting is
-  // cheap insurance for a loop that runs once per cacheBlock tile.
-  deviceVector<scalar>   ring_work;
-  deviceVector<scalar>   ring_scratch;
-
   A2ASpatialSum() : grid(nullptr), N_i(0), N_j(0), nt(0), nxyz(0), Nsc(0), nmom(1) {}
 
   void Allocate(int _N_i, int _N_j, GridBase *_grid)
@@ -970,147 +959,6 @@ public:
     }
   }
 
-  // Reduce over the spatial process axes only, leaving the time axis
-  // untouched. This is CartesianRingAllReduce's loop with d == Nd-1 skipped
-  // and the work/scratch buffers hoisted, which is why it calls
-  // RingAllReduceCore directly instead of the convenience wrapper.
-  //
-  // No sub-communicator is involved. ShiftedRanks gives the neighbours
-  // along one process axis of the parent Cartesian communicator, so ringing
-  // x then y then z reduces over exactly the P_xyz ranks that share this
-  // rank's t coordinate -- which is the set holding partial K sums of the
-  // same elements. Dimension-wise moves roughly 2n per axis against 2n
-  // total for a flat ring on a spatial sub-communicator, but every step is
-  // a neighbour link and there is no communicator to build, split or free.
-  // Local copy of RingAllReduceCore with both point-to-point exchanges
-  // moved off MPI_Sendrecv onto SendToRecvFromBegin/CommsComplete, for the
-  // reason documented above TemporalRingGather. Kept here rather than
-  // patched into RingAllReduce.h so a merge from develop cannot silently
-  // revert it; if the change is taken upstream, delete this and call
-  // RingAllReduceCore directly.
-  //
-  // Otherwise identical to the original: a reduce-scatter over P-1 steps
-  // leaving rank me owning fully reduced chunk (me+1)%P, then an all-gather
-  // circulating those chunks. work holds P*c elements, scratch holds c.
-  //
-  // Tags are constants rather than the step index. Each exchange is
-  // completed before the next begins, so at most one send and one receive
-  // are ever outstanding, and MPI orders messages within a given
-  // (source, dest, tag, communicator) tuple -- so steps cannot overtake one
-  // another. Constants also keep the value well clear of 32, above which it
-  // would collide with the rank term in SendToRecvFromBegin's
-  // tag = dir + rank*32.
-  void RingAllReduceCoreP2P(scalar *work, scalar *scratch,
-                            uint64_t c, int P, int me, int next, int prev)
-  {
-    if (P == 1) return;
-    uint64_t bytes = c * sizeof(scalar);
-
-    // Reduce-scatter. Receives into scratch, a separate allocation, so this
-    // phase never had the same-buffer exposure the all-gather below does.
-    for (int s = 0; s < P - 1; s++) {
-      int sendc = (me - s     + 2 * P) % P;
-      int recvc = (me - s - 1 + 2 * P) % P;
-      std::vector<MpiCommsRequest_t> reqs;
-      grid->SendToRecvFromBegin(reqs, (void *)&work[sendc * c], next,
-                                      (void *)scratch,          prev, bytes, 0);
-      grid->CommsComplete(reqs);
-      scalar *dst = &work[recvc * c];
-      accelerator_for(i, c, 1, { dst[i] = dst[i] + scratch[i]; });
-    }
-
-    // All-gather. Sends and receives into the same allocation at different
-    // offsets -- the shape the aliasing note is about.
-    for (int s = 0; s < P - 1; s++) {
-      int sendc = (me - s + 1 + 2 * P) % P;
-      int recvc = (me - s     + 2 * P) % P;
-      std::vector<MpiCommsRequest_t> reqs;
-      grid->SendToRecvFromBegin(reqs, (void *)&work[sendc * c], next,
-                                      (void *)&work[recvc * c], prev, bytes, 1);
-      grid->CommsComplete(reqs);
-    }
-  }
-
-  void SpatialRingReduce(scalar *buf, uint64_t n)
-  {
-    int nd_ = grid->Nd();
-    for (int d = 0; d < nd_ - 1; d++)
-    {
-      int P = grid->ProcessorGrid()[d];
-      if (P == 1) continue;
-
-      int me = grid->ThisProcessorCoor()[d];
-      int next, prev;
-      grid->ShiftedRanks(d, 1, prev, next);   // (dim, shift, source, dest)
-
-      uint64_t c = (n + P - 1) / P;
-      GRID_ASSERT(ring_work.size()    >= c * P);
-      GRID_ASSERT(ring_scratch.size() >= c);
-
-      scalar *w = &ring_work[0];
-      scalar *s = &ring_scratch[0];
-
-      // n is not generally a multiple of P, so the tail of the c*P working
-      // copy has to be zeroed or the padding chunks contribute garbage.
-      accelerator_for(i, c * P, 1, { w[i] = scalar(0.0); });
-      acceleratorCopyDeviceToDevice((void *)buf, (void *)w, n * sizeof(scalar));
-      RingAllReduceCoreP2P(w, s, c, P, me, next, prev);
-      acceleratorCopyDeviceToDevice((void *)w, (void *)buf, n * sizeof(scalar));
-    }
-  }
-
-  // All-gather half of the ring only. After SpatialRingReduce every slab is
-  // final, so nothing here combines values -- each step forwards the slot
-  // filled by the previous one, and after Pt-1 steps the panel is complete
-  // on every rank.
-  //
-  // The slot indices differ by one from RingAllReduceCore's all-gather
-  // loop: there the preceding reduce-scatter leaves rank me owning chunk
-  // (me+1)%P, whereas here each rank starts out already owning the slot for
-  // its own t coordinate.
-  // Deliberately uses SendToRecvFromBegin/CommsComplete (MPI_Irecv +
-  // MPI_Isend + waitall) rather than SendToRecvFrom, which is a bare
-  // MPI_Sendrecv (Communicator_mpi3.cc). skills/mpi-heterogeneous.md
-  // documents device-buffer aliasing in MPI_Sendrecv -- the library can
-  // reuse GPU addresses for internal staging without device memory
-  // ordering, corrupting data when the same pages appear on both paths --
-  // and names asynchronous send/receive pairs as the workaround. Every step
-  // here sends and receives into the same allocation at different offsets,
-  // which is exactly the exposed pattern, so take the documented route. The
-  // reported case is MPICH #7302 on Aurora rather than Frontier, but the
-  // alternative is already in Grid's API and costs nothing.
-  //
-  // Note RingAllReduceCore's own all-gather phase has the same exposure
-  // (it sends and receives into `work` at different offsets via
-  // SendToRecvFrom); worth raising upstream rather than working around
-  // here.
-  void TemporalRingGather(scalar *panel, uint64_t slabWords, int ct, int Pt)
-  {
-    // SendToRecvFromBegin asserts dest != _processor and from != _processor,
-    // so a single rank in time has to skip the loop rather than degenerate
-    // into a self-send.
-    if (Pt <= 1) return;
-
-    int nd_ = grid->Nd();
-    int next, prev;
-    grid->ShiftedRanks(nd_ - 1, 1, prev, next);
-
-    for (int s = 0; s < Pt - 1; s++) {
-      int sendslot = (ct - s     + 2 * Pt) % Pt;
-      int recvslot = (ct - s - 1 + 2 * Pt) % Pt;
-      // Constant tag, for the reason given above RingAllReduceCoreP2P: one
-      // exchange outstanding at a time plus MPI's per-tuple ordering makes
-      // the step index unnecessary, and keeps the value clear of the rank
-      // term in tag = dir + rank*32.
-      std::vector<MpiCommsRequest_t> reqs;
-      grid->SendToRecvFromBegin(reqs,
-                                (void *)(panel + (uint64_t)sendslot * slabWords), next,
-                                (void *)(panel + (uint64_t)recvslot * slabWords), prev,
-                                slabWords * sizeof(scalar), 2);
-      grid->CommsComplete(reqs);
-    }
-  }
-
   // Split-collective variant: the single padded GlobalSumVector of the
   // other Sum* functions is replaced by the two operations it was standing
   // in for, each done with the primitive that matches it.
@@ -1125,10 +973,17 @@ public:
   // impersonate concatenation, and paid reduction cost on nt_global when
   // only nt_local carried information.
   //
-  //   SpatialRingReduce    incomplete in K   arithmetic, P_xyz ranks,
+  //   CartesianRingAllReduce(orthogDim = nd-1)
+  //                        incomplete in K   arithmetic, P_xyz ranks,
   //                                          slab sized (nt local)
-  //   TemporalRingGather   incomplete in t   movement, P_t ranks,
+  //   CartesianRingAllGather(gatherDim = nd-1)
+  //                        incomplete in t   movement, P_t ranks,
   //                                          no arithmetic at all
+  //
+  // Both are Grid's own primitives. orthogDim landed in develop as 7abc19dc
+  // for exactly this case; gatherDim is its dual, and without it the gather
+  // would ring every dimension and materialise P_xyz identical copies of
+  // each slab, the reduce having already made those ranks agree.
   //
   // The order is forced: the gather only relays, so it is legal only once
   // every slab is final, which is what the reduce establishes.
@@ -1196,19 +1051,10 @@ public:
     GRID_ASSERT(grid->LocalStarts()[nd - 1] == ct * nt);
     GRID_ASSERT(nt_global == Pt * nt);
 
-    uint64_t slabMax = (uint64_t)nt * cacheBlock * nmom * cacheBlock;
-    size_t   tileMax = (size_t)nt_global * cacheBlock * cacheBlock * nmom;
-    int      maxP    = 1;
-    for (int d = 0; d < nd - 1; d++)
-      maxP = std::max(maxP, grid->ProcessorGrid()[d]);
+    size_t tileMax = (size_t)nt_global * cacheBlock * cacheBlock * nmom;
 
-    // c*P for the ring is at most n + P - 1; scratch is c, bounded above by
-    // n itself, which costs little at tile size and avoids re-deriving the
-    // bound per dimension.
-    if (ring_work.size()    < slabMax + maxP) ring_work.resize(slabMax + maxP);
-    if (ring_scratch.size() < slabMax)        ring_scratch.resize(slabMax);
-    if (tile_buf.size()     < tileMax)        tile_buf.resize(tileMax);
-    if (tile_host.size()    < tileMax)        tile_host.resize(tileMax);
+    if (tile_buf.size()  < tileMax) tile_buf.resize(tileMax);
+    if (tile_host.size() < tileMax) tile_host.resize(tileMax);
 
     const scalar *emf_p  = &EMF_mom_buf[0];
     scalar       *tile_p = &tile_buf[0];
@@ -1253,14 +1099,25 @@ public:
         if (timings) (*timings)[2] += dt;
         if (bytesMoved) (*bytesMoved)[2] += 2.0 * slabWords * sizeof(scalar);
 
+        // orthogDim = nd-1 skips the time axis, so this reduces over exactly
+        // the P_xyz ranks sharing this rank's t coordinate -- the set holding
+        // partial K sums of the same elements. No sub-communicator: the rings
+        // run on ShiftedRanks neighbours of the parent Cartesian communicator,
+        // one process axis at a time.
         dt = -usecond();
-        SpatialRingReduce(slab_p, slabWords);
+        CartesianRingAllReduce(grid, slab_p, slabWords, nd - 1);
         dt += usecond();
         if (timings) (*timings)[3] += dt;
         if (bytesMoved) (*bytesMoved)[3] += (double)slabWords * sizeof(scalar);
 
+        // gatherDim = nd-1 rings the time axis only, so the panel grows from
+        // this rank's slab to all Pt slabs and nothing is summed. Legal only
+        // because the reduce above has already made every slab final. The
+        // library allocates a second Pt*slabWords panel internally and copies
+        // back into tile_p, which is the price of not carrying a private
+        // in-place copy of the same loop.
         dt = -usecond();
-        TemporalRingGather(tile_p, slabWords, ct, Pt);
+        CartesianRingAllGather(grid, tile_p, slabWords, nd - 1);
         dt += usecond();
         if (timings) (*timings)[5] += dt;
         if (bytesMoved) (*bytesMoved)[5] += (double)(Pt - 1) * slabWords * sizeof(scalar);

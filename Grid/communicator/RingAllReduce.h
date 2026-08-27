@@ -128,7 +128,7 @@ void CartesianRingAllReduce(CartesianCommunicator *comm, T *buf, uint64_t n, int
 /////////////////////////////////////////////////////////////////////////////
 // Cartesian ring ALLGATHER, point-to-point only.
 //
-//   CartesianRingAllGather(comm, buf, chunk)
+//   CartesianRingAllGather(comm, buf, chunk, gatherDim=-1)
 //     buf holds P*chunk elements of T.  Block index = the Grid LEXICOGRAPHIC
 //     index of the owning process coordinate (dimension 0 fastest,
 //     Lexicographic::CoorFromIndex convention), NOT the MPI rank: on entry my
@@ -138,6 +138,16 @@ void CartesianRingAllReduce(CartesianCommunicator *comm, T *buf, uint64_t n, int
 //     lexicographically on Frontier -- the OptimalCommunicator relabels ranks
 //     for shared-memory locality; assuming rank order gave a wrong inverse,
 //     VERIFY 0.9965, 2026-08-26.)
+//
+//     gatherDim in 0..Nd-1: ring along THAT DIMENSION ONLY.  buf then holds
+//     P_d*chunk and the block index is simply my coordinate in that
+//     dimension, so no lexicographic inverse is involved.  This is the dual
+//     of CartesianRingAllReduce's orthogDim: reducing with orthogDim=d and
+//     then gathering with gatherDim=d splits a zero-padded allreduce into
+//     the sum it actually needed and the concatenation it was faking with
+//     addition.  Gathering all dimensions instead would deliver P/P_d
+//     identical copies of every block once the reduce has made the ranks
+//     off dimension d agree.  -1: all dimensions, as above.
 //
 // Dimension by dimension from dimension 0 (fastest) upward: each stage is a
 // ring over the P_d ranks of that line, after which the held block is the
@@ -157,18 +167,22 @@ inline int CartesianLexIndex(CartesianCommunicator *comm)
 }
 
 template<class T>
-void CartesianRingAllGather(CartesianCommunicator *comm, T *buf, uint64_t chunk)
+void CartesianRingAllGather(CartesianCommunicator *comm, T *buf, uint64_t chunk, int gatherDim=-1)
 {
-  int P  = comm->ProcessorCount();
-  if ( P==1 || chunk==0 ) return;
   int Nd = comm->_ndimension;
-  int mylex = CartesianLexIndex(comm);
+  GRID_ASSERT( gatherDim >= -1 && gatherDim < Nd );
+  // P counts the ranks taking part in the gather, so it sizes `work` and the
+  // closing assert unchanged in both modes
+  int P  = (gatherDim<0) ? comm->ProcessorCount() : comm->_processors[gatherDim];
+  if ( P==1 || chunk==0 ) return;
+  int mylex = (gatherDim<0) ? CartesianLexIndex(comm) : comm->_processor_coor[gatherDim];
   deviceVector<T> work((uint64_t)P*chunk);
   // ping-pong between buf and work; the held block lives at offset `off` in `cur`
   T *cur = buf;       uint64_t off = (uint64_t)mylex*chunk;
   T *oth = &work[0];
   uint64_t blk = chunk;                        // elements in the held block
   for(int d=0; d<Nd; d++){                     // dimension 0 first: it is the fastest lex index
+    if ( gatherDim>=0 && d!=gatherDim ) continue;
     int Pd = comm->_processors[d];
     if ( Pd==1 ) continue;
     int med = comm->_processor_coor[d];
