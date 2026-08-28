@@ -976,14 +976,16 @@ public:
   //   CartesianRingAllReduce(orthogDim = nd-1)
   //                        incomplete in K   arithmetic, P_xyz ranks,
   //                                          slab sized (nt local)
-  //   CartesianRingAllGather(gatherDim = nd-1)
+  //   CartesianRingAllGather(dim = nd-1)
   //                        incomplete in t   movement, P_t ranks,
   //                                          no arithmetic at all
   //
-  // Both are Grid's own primitives. orthogDim landed in develop as 7abc19dc
-  // for exactly this case; gatherDim is its dual, and without it the gather
-  // would ring every dimension and materialise P_xyz identical copies of
-  // each slab, the reduce having already made those ranks agree.
+  // Both are Grid's own primitives, and both are handed nd-1 here for
+  // opposite reasons: orthogDim names the dimension to SKIP, dim names the
+  // only dimension to RING. orthogDim landed in develop as 7abc19dc for
+  // exactly this case; dim is its dual, and without it the gather would ring
+  // every dimension and materialise P_xyz identical copies of each slab, the
+  // reduce having already made those ranks agree.
   //
   // The order is forced: the gather only relays, so it is legal only once
   // every slab is final, which is what the reduce establishes.
@@ -1110,7 +1112,7 @@ public:
         if (timings) (*timings)[3] += dt;
         if (bytesMoved) (*bytesMoved)[3] += (double)slabWords * sizeof(scalar);
 
-        // gatherDim = nd-1 rings the time axis only, so the panel grows from
+        // dim = nd-1 rings the time axis only, so the panel grows from
         // this rank's slab to all Pt slabs and nothing is summed. Legal only
         // because the reduce above has already made every slab final. The
         // library allocates a second Pt*slabWords panel internally and copies
