@@ -43,33 +43,25 @@ NAMESPACE_BEGIN(Grid);
   Computes:
     EMF[i,j,t] = sum_{x,s,c} leftv[i][x,t,s,c] * loopRight[j][x,t,s,c]
 
-  via batched GEMM over nt local time slices, then GlobalSumVector across MPI.
+  via batched GEMM over nt local time slices, then a ring reduction and a
+  ring gather across MPI (see SumRing).
 
   Memory layout (all C row-major):
-    W_buf  [nt][N_i][nxyz*Nsc]  - W[t][i][x*Nsc+sc]  = leftv[i] at (x,t)
-    LR_buf [nt][N_j][nxyz*Nsc]  - LR[t][j][x*Nsc+sc] = loopRight[j] at (x,t)
-    EMF_buf[nt][N_j][N_i]       - column-major result; EMF[i,j,t] = EMF_buf[t][j][i]
+    W_buf      [nt][N_i][nxyz*Nsc]        W[t][i][x*Nsc+sc]  = leftv[i] at (x,t)
+    LR_buf     [nt][N_j][nxyz*Nsc]        LR[t][j][x*Nsc+sc] = loopRight[j] at (x,t)
+    LR_mom_buf [nt][nmom][N_j][nxyz*Nsc]  LRM[t][m][j][...]  = LR[t][j][...] * phase_m[x]
+    EMF_mom_buf[nt][N_i][nmom*N_j]        GEMM output
 
-  BLAS call (column-major, OP_T on A so A is read as W[i][k]):
-    C = A^T * B  where A=W[N_ixK C-row], B=LR[N_jxK C-row], C=[N_jxN_i C-row]
-    -> C[i,j] = sum_k W[i][k] * LR[j][k] = EMF[i,j]
+  Momentum folds into the GEMM's N dimension rather than repeating the GEMM
+  once per momentum: ApplyAllPhaseRight reads the unphased pack in LR_buf and
+  writes nmom phase-multiplied copies into LR_mom_buf. K and M (nxyz*Nsc and
+  N_i) are unchanged; N widens from N_j to nmom*N_j with m the slower-varying
+  sub-index, so each timeslice is nmom contiguous [N_j][nxyz*Nsc] blocks --
+  what gemmBatched wants, no repacking. At nmom=1 with no phase applied the
+  GEMM reads LR_buf directly and LR_mom_buf is never allocated; see
+  AllocateRight.
 
-  Multi-momentum path (SumAllMomenta): folds a momentum index into the
-  GEMM's N dimension instead of redoing the whole GEMM once per momentum.
-  ApplyAllPhaseRight reads the single unphased pack in LR_buf (built by the
-  existing PackRight, unchanged) and writes nmom phase-multiplied copies
-  into a separate, wider buffer:
-
-    LR_mom_buf [nt][nmom][N_j][nxyz*Nsc] - LRM[t][m][j][x*Nsc+sc]
-                                            = LR_buf[t][j][x*Nsc+sc] * phase_m[x]
-    EMF_mom_buf[nt][nmom*N_j][N_i]       - same layout as EMF_buf, N widened
-
-  K and M (nxyz*Nsc and N_i) are unchanged; only N widens from N_j to
-  nmom*N_j, and m is the slower-varying sub-index within that widened N so
-  each timeslice's LR_mom_buf slice is nmom contiguous [N_j][nxyz*Nsc]
-  blocks -- exactly what gemmBatched wants, no further repacking.
-  LR_buf/EMF_buf and W_buf/W_ptrs are untouched by this path, so existing
-  single-momentum callers (EMF, CMF, Sum()) are unaffected.
+  Operand order and the index layout it produces are documented above SumRing.
 */
 template<class vobj>
 class A2ASpatialSum
@@ -83,19 +75,16 @@ public:
   int nt, nxyz, Nsc;
   int nmom;
 
-  // Default GlobalSumVector tiling granularity for the *CacheBlocked Sum
-  // variants when a caller doesn't pick one explicitly (see the no-cacheBlock
-  // SumCacheBlocked overload below). 12 divides most A2A mode-set sizes in
-  // practice; callers with a reason to differ (e.g. Hadrons XML) should still
-  // pass cacheBlock explicitly rather than changing this.
-  static constexpr int DefaultCacheBlock = 12;
+  // Bytes the reduce puts on the wire per byte of payload: 2(P_d-1)/P_d
+  // summed over the spatial dimensions only, matching
+  // CartesianRingAllReduce(orthogDim = nd-1). Fixed by the process grid, so
+  // set once in AllocateRight. Exact, being a count of sends this code
+  // issues itself rather than an assumption about MPI.
+  double wire_ring_reduce;
 
   deviceVector<scalar>   W_buf;
   deviceVector<scalar>   LR_buf;
-  deviceVector<scalar>   EMF_buf;
   deviceVector<scalar *> W_ptrs;
-  deviceVector<scalar *> LR_ptrs;
-  deviceVector<scalar *> EMF_ptrs;
 
   // Multi-momentum path: built alongside, not instead of, the buffers
   // above -- see class comment.
@@ -104,120 +93,86 @@ public:
   deviceVector<scalar *> LR_mom_ptrs;
   deviceVector<scalar *> EMF_mom_ptrs;
 
-  // GSV staging for the Device and Ring variants below. tile_buf holds one
-  // cacheBlock tile at full nt_global extent; tile_host is the host landing
-  // buffer for the reduced tile. Sized lazily rather than in Allocate,
-  // because nt_global and cacheBlock are only known at the call site.
+  // Staging for SumRing below. tile_buf holds one cacheBlock tile at full
+  // nt_global extent; tile_host is the host landing buffer for the gathered
+  // tile. Sized lazily rather than in Allocate, because nt_global and
+  // cacheBlock are only known at the call site.
   deviceVector<scalar>   tile_buf;
   std::vector<scalar>    tile_host;
 
-  A2ASpatialSum() : grid(nullptr), N_i(0), N_j(0), nt(0), nxyz(0), Nsc(0), nmom(1) {}
+  A2ASpatialSum() : grid(nullptr), N_i(0), N_j(0), nt(0), nxyz(0), Nsc(0), nmom(1),
+                    wire_ring_reduce(0.0) {}
 
-  void Allocate(int _N_i, int _N_j, GridBase *_grid)
+  // Aim LR_mom_ptrs at the buffer holding the GEMM's right operand. The
+  // per-timeslice stride is nmom*N_j*nxyz*Nsc; when base is LR_buf that is
+  // the unphased pack's own stride, LR_buf only ever holding one momentum.
+  void PointRightOperand(scalar *base)
+  {
+    int lN_j = N_j, lnxyz = nxyz, lNsc = Nsc, lnmom = nmom;
+    for (int t = 0; t < nt; t++)
+      acceleratorPut(LR_mom_ptrs[t], base + (size_t)t * lnmom * lN_j * lnxyz * lNsc);
+  }
+
+  // Binds the grid and everything derived from it, so this runs before
+  // AllocateLeft and before any Pack.
+  //
+  // LR_mom_ptrs names the GEMM's right operand: LR_buf while no phase has
+  // been applied, LR_mom_buf once ApplyAllPhaseRight has written one. An
+  // unphased caller therefore needs neither a second buffer nor a copy --
+  // LR_buf already holds exactly what the GEMM reads -- while a single
+  // momentum carrying a real phase still gets its own storage. Only nmom=1
+  // can be left unphased, since LR_buf has room for one momentum.
+  void AllocateRight(int _N_j, GridBase *_grid, int _nmom = 1)
   {
     grid = _grid;
-    N_i  = _N_i;
     N_j  = _N_j;
+    nmom = _nmom;
     Coordinate ldims = grid->LocalDimensions();
     nt   = ldims[grid->Nd() - 1];
     nxyz = grid->lSites() / nt;
     Nsc  = sizeof(sobj) / sizeof(scalar);
-  
-    W_buf.resize(nt * N_i * nxyz * Nsc);
-    LR_buf.resize(nt * N_j * nxyz * Nsc);
-    EMF_buf.resize(nt * N_j * N_i);
-  
-    // Build persistent batch pointer arrays
-    W_ptrs.resize(nt);
-    LR_ptrs.resize(nt);
-    EMF_ptrs.resize(nt);
-    scalar *Wh   = &W_buf[0];
-    scalar *LRh  = &LR_buf[0];
-    scalar *EMFh = &EMF_buf[0];
-    int lN_i = N_i, lN_j = N_j, lnxyz = nxyz, lNsc = Nsc;
-    for (int t = 0; t < nt; t++) {
-      acceleratorPut(W_ptrs[t],   Wh   + t * lN_i * lnxyz * lNsc);
-      acceleratorPut(LR_ptrs[t],  LRh  + t * lN_j * lnxyz * lNsc);
-      acceleratorPut(EMF_ptrs[t], EMFh + t * lN_j * lN_i);
+
+    wire_ring_reduce = 0.0;
+    for (int d = 0; d < grid->Nd() - 1; d++) {
+      int Pd = grid->ProcessorGrid()[d];
+      if (Pd > 1) wire_ring_reduce += 2.0 * (Pd - 1) / (double)Pd;
+    }
+
+    size_t LRsz = (size_t)nt * N_j * nxyz * Nsc;
+    if (LR_buf.size()      < LRsz)        LR_buf.resize(LRsz);
+    if (LR_mom_ptrs.size() < (size_t)nt)  LR_mom_ptrs.resize(nt);
+
+    if (nmom > 1) {
+      // No valid default: ApplyAllPhaseRight has to run before the GEMM and
+      // aims the pointers itself. Sizing here keeps the resize out of the
+      // per-gamma inner loop.
+      size_t LRMsz = (size_t)nt * nmom * N_j * nxyz * Nsc;
+      if (LR_mom_buf.size() < LRMsz) LR_mom_buf.resize(LRMsz);
+    } else {
+      PointRightOperand(&LR_buf[0]);
     }
   }
 
-  void AllocateRight(int _N_j, GridBase *_grid)
-  {
-    grid = _grid;
-    N_j  = _N_j;
-    Coordinate ldims = grid->LocalDimensions();
-    nt   = ldims[grid->Nd() - 1];
-    nxyz = grid->lSites() / nt;
-    Nsc  = sizeof(sobj) / sizeof(scalar);
-
-    size_t LRsz = (size_t)nt * N_j * nxyz * Nsc;
-    if (LR_buf.size()  < LRsz)        LR_buf.resize(LRsz);
-    if (LR_ptrs.size() < (size_t)nt)  LR_ptrs.resize(nt);
-
-    scalar *LRh = &LR_buf[0];
-    int lN_j = N_j, lnxyz = nxyz, lNsc = Nsc;
-    for (int t = 0; t < nt; t++)
-      acceleratorPut(LR_ptrs[t], LRh + t * lN_j * lnxyz * lNsc);
-  }
-
-  // Multi-momentum overload: delegates to the two-argument AllocateRight
-  // above for everything it already does, then unconditionally builds
-  // LR_mom_buf/LR_mom_ptrs (SumAllMomenta's right operand). Callers of the
-  // two-argument overload never reach this and pay nothing for it.
-  void AllocateRight(int _N_j, GridBase *_grid, int _nmom)
-  {
-    AllocateRight(_N_j, _grid);
-    nmom = _nmom;
-
-    size_t LRMsz = (size_t)nt * nmom * N_j * nxyz * Nsc;
-    if (LR_mom_buf.size()  < LRMsz)       LR_mom_buf.resize(LRMsz);
-    if (LR_mom_ptrs.size() < (size_t)nt)  LR_mom_ptrs.resize(nt);
-
-    scalar *LRMh  = &LR_mom_buf[0];
-    int     lN_j  = N_j, lnxyz = nxyz, lNsc = Nsc, lnmom = nmom;
-    for (int t = 0; t < nt; t++)
-      acceleratorPut(LR_mom_ptrs[t], LRMh + (size_t)t * lnmom * lN_j * lnxyz * lNsc);
-  }
-
-  // AllocateRight must be called first: N_j, nt, nxyz, Nsc must be set.
+  // AllocateRight must be called first: N_j, nt, nxyz, Nsc and nmom come
+  // from there rather than being passed again.
   void AllocateLeft(int _N_i)
   {
     N_i = _N_i;
 
-    size_t Wsz   = (size_t)nt * N_i * nxyz * Nsc;
-    size_t EMFsz = (size_t)nt * N_j * N_i;
-    if (W_buf.size()    < Wsz)         W_buf.resize(Wsz);
-    if (EMF_buf.size()  < EMFsz)       EMF_buf.resize(EMFsz);
-    if (W_ptrs.size()   < (size_t)nt)  W_ptrs.resize(nt);
-    if (EMF_ptrs.size() < (size_t)nt)  EMF_ptrs.resize(nt);
-
-    scalar *Wh   = &W_buf[0];
-    scalar *EMFh = &EMF_buf[0];
-    int lN_i = N_i, lN_j = N_j, lnxyz = nxyz, lNsc = Nsc;
-    for (int t = 0; t < nt; t++) {
-      acceleratorPut(W_ptrs[t],   Wh   + t * lN_i * lnxyz * lNsc);
-      acceleratorPut(EMF_ptrs[t], EMFh + t * lN_j * lN_i);
-    }
-  }
-
-  // Multi-momentum overload: delegates to the one-argument AllocateLeft
-  // above, then unconditionally builds EMF_mom_buf/EMF_mom_ptrs. The
-  // three-argument AllocateRight must have been called first so nmom is
-  // set; _nmom here is checked against it rather than trusted blindly.
-  void AllocateLeft(int _N_i, int _nmom)
-  {
-    AllocateLeft(_N_i);
-    GRID_ASSERT(_nmom == nmom);
-
+    size_t Wsz    = (size_t)nt * N_i * nxyz * Nsc;
     size_t EMFMsz = (size_t)nt * nmom * N_j * N_i;
-    if (EMF_mom_buf.size()  < EMFMsz)      EMF_mom_buf.resize(EMFMsz);
-    if (EMF_mom_ptrs.size() < (size_t)nt)  EMF_mom_ptrs.resize(nt);
+    if (W_buf.size()        < Wsz)        W_buf.resize(Wsz);
+    if (EMF_mom_buf.size()  < EMFMsz)     EMF_mom_buf.resize(EMFMsz);
+    if (W_ptrs.size()       < (size_t)nt) W_ptrs.resize(nt);
+    if (EMF_mom_ptrs.size() < (size_t)nt) EMF_mom_ptrs.resize(nt);
 
+    scalar *Wh    = &W_buf[0];
     scalar *EMFMh = &EMF_mom_buf[0];
-    int     lN_j  = N_j, lnmom = nmom;
-    for (int t = 0; t < nt; t++)
-      acceleratorPut(EMF_mom_ptrs[t], EMFMh + (size_t)t * lnmom * lN_j * N_i);
+    int lN_i = N_i, lN_j = N_j, lnxyz = nxyz, lNsc = Nsc, lnmom = nmom;
+    for (int t = 0; t < nt; t++) {
+      acceleratorPut(W_ptrs[t],       Wh    + (size_t)t * lN_i * lnxyz * lNsc);
+      acceleratorPut(EMF_mom_ptrs[t], EMFMh + (size_t)t * lnmom * lN_j * lN_i);
+    }
   }
 
   void PackLeft(const std::vector<Lattice<vobj>> &leftv, int start = 0, int count = -1)
@@ -298,199 +253,22 @@ public:
 
 public:
 
-  // Batched GEMM + MPI reduction -> result[nt_global][N_i][N_j]
-  //
   // BLAS (column-major, OP_T on A):
   //   C[N_jxN_i] = A^T[N_ixK] * B[N_jxK]    with K=nxyz*Nsc
   //   reading A as C row-major [N_i][K] and B as C row-major [N_j][K]
   //   -> C[i,j] = sum_k W[i,k] * LR[j,k] = EMF[i,j]
   //
-  // result's layout defaults to ColMajor (Eigen::Tensor's own default) so
-  // every existing caller is unaffected; callers whose consumer expects
-  // j-fastest (e.g. writing into a RowMajor A2AMatrixSet for HDF5) should
-  // pass a RowMajor result -- this loop's writes are then contiguous
-  // instead of striding by nt_global*N_i per j, with no code change here.
-  // timings[0]: GEMM + synchronise
-  // timings[1]: device->host copy
-  // timings[2]: transpose (host_emf -> global_emf)
-  // timings[3]: GlobalSumVector
-  // timings[4]: transpose (global_emf -> result)
+  // result's layout defaults to ColMajor (Eigen::Tensor's own default);
+  // callers whose consumer expects j-fastest (e.g. writing into a RowMajor
+  // A2AMatrixSet for HDF5) should pass a RowMajor result -- the scatter's
+  // writes are then contiguous instead of striding by nt_global*N_i per j.
   //
-  // bytesMoved mirrors timings[1..4] (slot 0/GEMM is FLOP-bound, not
-  // bandwidth-bound, so left untouched) with the bytes handled by that stage,
-  // summed the same way (+=) so a caller accumulating timings across many
-  // calls (e.g. per cache-block tile) gets a matching total to divide by for
-  // an average throughput. [1]/[3] count the buffer once (one-directional
-  // copy / the message GlobalSumVector reduces); [2]/[4] count read+write
-  // (2x element count) since both are host-side gather/scatter touching two
-  // separate buffers.
-  template <int Layout = Eigen::ColMajor>
-  void Sum(Eigen::Tensor<ComplexD, 3, Layout> &result,
-           std::array<double, 5> *timings = nullptr,
-           std::array<double, 5> *bytesMoved = nullptr)
-  {
-    GridBLAS BLAS;
-    double dt;
-
-    int K = nxyz * Nsc;
-    dt = -usecond();
-    BLAS.gemmBatched(GridBLAS_OP_T, GridBLAS_OP_N,
-                     N_i, N_j, K,
-                     scalar(1.0),
-                     W_ptrs,
-                     LR_ptrs,
-                     scalar(0.0),
-                     EMF_ptrs);
-    BLAS.synchronise();
-    dt += usecond();
-    if (timings) (*timings)[0] += dt;
-
-    int nt_global = result.dimension(0);
-    int nd        = grid->Nd();
-    int lt_start  = grid->LocalStarts()[nd - 1];
-
-    std::vector<scalar> host_emf(nt * N_j * N_i);
-    dt = -usecond();
-    acceleratorCopyFromDevice(&EMF_buf[0], host_emf.data(),
-                              nt * N_j * N_i * sizeof(scalar));
-    dt += usecond();
-    if (timings) (*timings)[1] += dt;
-    if (bytesMoved) (*bytesMoved)[1] += (double)nt * N_j * N_i * sizeof(scalar);
-
-    // Both loops are pure host-side CPU work; loop nests are perfectly nested
-    // for collapse(3) following the thread_for_collapse precedent at A2Autils.h:1503.
-    std::vector<scalar> global_emf(nt_global * N_i * N_j, scalar(0.0));
-    dt = -usecond();
-    thread_for_collapse(3, lt, nt, {
-        for (int i = 0; i < N_i; i++)
-        for (int j = 0; j < N_j; j++)
-          global_emf[((int)lt + lt_start) * N_i * N_j + i * N_j + j]
-              = host_emf[(int)lt * N_j * N_i + j * N_i + i];
-    });
-    dt += usecond();
-    if (timings) (*timings)[2] += dt;
-    if (bytesMoved) (*bytesMoved)[2] += 2.0 * nt * N_i * N_j * sizeof(scalar);
-
-    dt = -usecond();
-    grid->GlobalSumVector(global_emf.data(), nt_global * N_i * N_j);
-    dt += usecond();
-    if (timings) (*timings)[3] += dt;
-    if (bytesMoved) (*bytesMoved)[3] += (double)nt_global * N_i * N_j * sizeof(scalar);
-
-    dt = -usecond();
-    thread_for_collapse(3, gt, nt_global, {
-        for (int i = 0; i < N_i; i++)
-        for (int j = 0; j < N_j; j++)
-          result((int)gt, i, j) = global_emf[(int)gt * N_i * N_j + i * N_j + j];
-    });
-    dt += usecond();
-    if (timings) (*timings)[4] += dt;
-    if (bytesMoved) (*bytesMoved)[4] += 2.0 * nt_global * N_i * N_j * sizeof(scalar);
-  }
-
-  // Same GEMM as Sum() (M=N_i, N=N_j, K=nxyz*Nsc, run once at full block
-  // size for GEMM efficiency), but GlobalSumVector is decoupled from the
-  // GEMM tile: the local result is sliced into cacheBlock x cacheBlock
-  // (i,j) tiles -- each spanning the full nt_global, same as FMF's own
-  // cache-tile loop -- and reduced with one small GlobalSumVector call per
-  // tile instead of one call covering the whole N_i x N_j block. GEMM size
-  // and GSV size are therefore independently tunable: cacheBlock controls
-  // only collective granularity, never the GEMM shape.
-  //
-  // timings[0]: GEMM + synchronise
-  // timings[1]: device->host copy
-  // timings[2]: local fill (host_emf -> per-tile buffer), summed over tiles
-  // timings[3]: GlobalSumVector, summed over tiles
-  // timings[4]: scatter (per-tile buffer -> result), summed over tiles
-
-  // No-cacheBlock overload: uses DefaultCacheBlock. This is the intended
-  // call form for callers that don't need Hadrons-level control over GSV
-  // tiling (EMF, CMOF) -- the tiling granularity stays a Grid-internal
-  // concern rather than an XML-exposed parameter.
-  template <int Layout = Eigen::ColMajor>
-  void SumCacheBlocked(Eigen::Tensor<ComplexD, 3, Layout> &result,
-                       std::array<double, 5> *timings = nullptr,
-                       std::array<double, 5> *bytesMoved = nullptr)
-  {
-    SumCacheBlocked(result, DefaultCacheBlock, timings, bytesMoved);
-  }
-
-  // bytesMoved: see the comment above Sum() -- same [1..4] convention,
-  // accumulated per (ii,jj) tile the same way timings is, so the totals
-  // after the full N_i x N_j sweep match Sum()'s single-call totals
-  // regardless of cacheBlock (only the call count and per-call size differ).
-  template <int Layout = Eigen::ColMajor>
-  void SumCacheBlocked(Eigen::Tensor<ComplexD, 3, Layout> &result,
-                       int cacheBlock,
-                       std::array<double, 5> *timings = nullptr,
-                       std::array<double, 5> *bytesMoved = nullptr)
-  {
-    GridBLAS BLAS;
-    double dt;
-
-    int K = nxyz * Nsc;
-    dt = -usecond();
-    BLAS.gemmBatched(GridBLAS_OP_T, GridBLAS_OP_N,
-                     N_i, N_j, K,
-                     scalar(1.0),
-                     W_ptrs,
-                     LR_ptrs,
-                     scalar(0.0),
-                     EMF_ptrs);
-    BLAS.synchronise();
-    dt += usecond();
-    if (timings) (*timings)[0] += dt;
-
-    int nt_global = result.dimension(0);
-    int nd        = grid->Nd();
-    int lt_start  = grid->LocalStarts()[nd - 1];
-
-    std::vector<scalar> host_emf(nt * N_j * N_i);
-    dt = -usecond();
-    acceleratorCopyFromDevice(&EMF_buf[0], host_emf.data(),
-                              nt * N_j * N_i * sizeof(scalar));
-    dt += usecond();
-    if (timings) (*timings)[1] += dt;
-    if (bytesMoved) (*bytesMoved)[1] += (double)nt * N_j * N_i * sizeof(scalar);
-
-    for (int ii = 0; ii < N_i; ii += cacheBlock)
-    {
-      int Niii = std::min(N_i - ii, cacheBlock);
-      for (int jj = 0; jj < N_j; jj += cacheBlock)
-      {
-        int Njjj = std::min(N_j - jj, cacheBlock);
-
-        std::vector<scalar> tile((size_t)nt_global * Niii * Njjj, scalar(0.0));
-        dt = -usecond();
-        thread_for_collapse(3, lt, nt, {
-            for (int iii = 0; iii < Niii; iii++)
-            for (int jjj = 0; jjj < Njjj; jjj++)
-              tile[((int)lt + lt_start) * Niii * Njjj + iii * Njjj + jjj]
-                  = host_emf[(int)lt * N_j * N_i + (jj + jjj) * N_i + (ii + iii)];
-        });
-        dt += usecond();
-        if (timings) (*timings)[2] += dt;
-        if (bytesMoved) (*bytesMoved)[2] += 2.0 * nt * Niii * Njjj * sizeof(scalar);
-
-        dt = -usecond();
-        grid->GlobalSumVector(tile.data(), (size_t)nt_global * Niii * Njjj);
-        dt += usecond();
-        if (timings) (*timings)[3] += dt;
-        if (bytesMoved) (*bytesMoved)[3] += (double)nt_global * Niii * Njjj * sizeof(scalar);
-
-        dt = -usecond();
-        thread_for_collapse(3, gt, nt_global, {
-            for (int iii = 0; iii < Niii; iii++)
-            for (int jjj = 0; jjj < Njjj; jjj++)
-              result((int)gt, ii + iii, jj + jjj)
-                  = tile[(int)gt * Niii * Njjj + iii * Njjj + jjj];
-        });
-        dt += usecond();
-        if (timings) (*timings)[4] += dt;
-        if (bytesMoved) (*bytesMoved)[4] += 2.0 * nt_global * Niii * Njjj * sizeof(scalar);
-      }
-    }
-  }
+  // bytesMoved mirrors timings (slot 0/GEMM is FLOP-bound, not bandwidth-
+  // bound, so left untouched) with the bytes handled by that stage, summed
+  // the same way (+=) so a caller accumulating across many calls gets a
+  // matching total to divide by for an average throughput. Host-side
+  // gather/scatter slots count read+write (2x element count); comms slots
+  // count bytes on the wire, see wire_ring_reduce above.
 
   // Unpack a ComplexField phase into a flat array of one scalar per spatial site l_xyz.
   // ph is assumed time-independent; all t-layers write the same value so redundant
@@ -569,11 +347,20 @@ public:
   // Read the unphased pack in LR_buf (built by PackRight, untouched by this
   // path) and write nmom phase-multiplied copies into LR_mom_buf[t][m][j][
   // l_xyz*Nsc+sc]. One kernel launch, with m folded into the parallel index
-  // space alongside (j, l_xyz) -- not nmom separate launches. Requires the
-  // three-argument AllocateRight to have been called first.
+  // space alongside (j, l_xyz) -- not nmom separate launches. Requires
+  // AllocateRight to have been called first.
+  //
+  // Sole writer of LR_mom_buf, so it also aims LR_mom_ptrs there, superseding
+  // the unphased default AllocateRight leaves at nmom=1. Source and
+  // destination are always distinct buffers, so no thread reads a slot
+  // another is phasing.
   void ApplyAllPhaseRight(const std::vector<deviceVector<scalar>> &phase_bufs)
   {
     GRID_ASSERT((int)phase_bufs.size() == nmom);
+
+    size_t LRMsz = (size_t)nt * nmom * N_j * nxyz * Nsc;
+    if (LR_mom_buf.size() < LRMsz) LR_mom_buf.resize(LRMsz);
+    PointRightOperand(&LR_mom_buf[0]);
 
     deviceVector<scalar *> ph_ptrs(nmom);
     for (int m = 0; m < nmom; m++)
@@ -610,358 +397,9 @@ public:
     });
   }
 
-  // Batched GEMM + MPI reduction, folding momentum into N: same K=nxyz*Nsc
-  // and M=N_i as Sum(), N widens from N_j to nmom*N_j by reading
-  // LR_mom_ptrs/EMF_mom_ptrs (built by ApplyAllPhaseRight and the
-  // three-argument Allocate* overloads) instead of LR_ptrs/EMF_ptrs. One
-  // GEMM and one GlobalSumVector for the whole block, covering every
-  // momentum, instead of one pair per momentum via Sum().
-  //
-  // result[nt_global][N_i][nmom][N_j] -- nmom before N_j (not after) so that
-  // with a RowMajor result, the fastest dimension (N_j) lines up with col's
-  // own fastest sub-index (col=m*N_j+j, j fastest) and global_emf's own
-  // layout (col fastest); the final transpose becomes a straight contiguous
-  // copy on both sides instead of a stride-nmom scatter into result.
-  // timings[] slots match Sum()'s; bytesMoved[] mirrors timings[1..4] the
-  // same way as Sum() (see comment above Sum()), with N_j widened to
-  // nmom*N_j throughout since every stage here reads/writes the wide buffers.
-  template <int Layout = Eigen::ColMajor>
-  void SumAllMomenta(Eigen::Tensor<ComplexD, 4, Layout> &result,
-                      std::array<double, 5> *timings = nullptr,
-                      std::array<double, 5> *bytesMoved = nullptr)
-  {
-    GridBLAS BLAS;
-    double dt;
-
-    int K     = nxyz * Nsc;
-    int Nwide = nmom * N_j;
-
-    dt = -usecond();
-    BLAS.gemmBatched(GridBLAS_OP_T, GridBLAS_OP_N,
-                     N_i, Nwide, K,
-                     scalar(1.0),
-                     W_ptrs,
-                     LR_mom_ptrs,
-                     scalar(0.0),
-                     EMF_mom_ptrs);
-    BLAS.synchronise();
-    dt += usecond();
-    if (timings) (*timings)[0] += dt;
-
-    int nt_global = result.dimension(0);
-    int nd        = grid->Nd();
-    int lt_start  = grid->LocalStarts()[nd - 1];
-
-    std::vector<scalar> host_emf((size_t)nt * Nwide * N_i);
-    dt = -usecond();
-    acceleratorCopyFromDevice(&EMF_mom_buf[0], host_emf.data(),
-                              (size_t)nt * Nwide * N_i * sizeof(scalar));
-    dt += usecond();
-    if (timings) (*timings)[1] += dt;
-    if (bytesMoved) (*bytesMoved)[1] += (double)nt * Nwide * N_i * sizeof(scalar);
-
-    std::vector<scalar> global_emf((size_t)nt_global * N_i * Nwide, scalar(0.0));
-    dt = -usecond();
-    thread_for_collapse(3, lt, nt, {
-        for (int i = 0; i < N_i; i++)
-        for (int col = 0; col < Nwide; col++)
-          global_emf[((int)lt + lt_start) * N_i * Nwide + i * Nwide + col]
-              = host_emf[(int)lt * Nwide * N_i + col * N_i + i];
-    });
-    dt += usecond();
-    if (timings) (*timings)[2] += dt;
-    if (bytesMoved) (*bytesMoved)[2] += 2.0 * nt * N_i * Nwide * sizeof(scalar);
-
-    dt = -usecond();
-    grid->GlobalSumVector(global_emf.data(), (size_t)nt_global * N_i * Nwide);
-    dt += usecond();
-    if (timings) (*timings)[3] += dt;
-    if (bytesMoved) (*bytesMoved)[3] += (double)nt_global * N_i * Nwide * sizeof(scalar);
-
-    dt = -usecond();
-    thread_for_collapse(3, gt, nt_global, {
-        for (int i = 0; i < N_i; i++)
-        for (int col = 0; col < Nwide; col++) {
-          int m = col / N_j;
-          int j = col % N_j;
-          result((int)gt, i, m, j) = global_emf[(int)gt * N_i * Nwide + i * Nwide + col];
-        }
-    });
-    dt += usecond();
-    if (timings) (*timings)[4] += dt;
-    if (bytesMoved) (*bytesMoved)[4] += 2.0 * nt_global * N_i * Nwide * sizeof(scalar);
-  }
-
-  // Same GEMM as SumAllMomenta (M=N_i, N=nmom*N_j, K=nxyz*Nsc, momentum
-  // folded into the GEMM's wide dimension), but GlobalSumVector decoupled
-  // from the GEMM tile the same way SumCacheBlocked decouples it from
-  // Sum(): the local result is sliced into cacheBlock x cacheBlock (i,j)
-  // tiles, each still spanning the full nt_global and all nmom momenta in
-  // one call -- matching FMF's own cache-tile message shape exactly --
-  // instead of one call covering the whole N_i x nmom*N_j block.
-  //
-  // result[nt_global][N_i][N_j][nmom] -- deliberately the OPPOSITE dimension
-  // order from SumAllMomenta (nmom last, not before N_j). Unlike
-  // SumAllMomenta, this function stages through its own tile buffer (laid
-  // out m-fastest, see the fill step below) instead of reading straight out
-  // of the GEMM's own col=m*N_j+j-ordered output, so it isn't constrained
-  // by that layout -- tile's m-fastest storage and the scatter loop's
-  // m-innermost order already agree with each other, and with a RowMajor
-  // result[...][nmom] (m fastest there too), so both the read from tile and
-  // the write into result are contiguous simultaneously. Do not "align"
-  // this with SumAllMomenta's layout -- they need different ones.
-  // timings[] slots match Sum()'s.
-
-  // No-cacheBlock overload: uses DefaultCacheBlock. Intended call form for
-  // callers that don't need Hadrons-level control over GSV tiling (EMF,
-  // CMOF, and any other nmom=1 caller of this engine) -- mirrors
-  // SumCacheBlocked's no-cacheBlock overload above.
-  template <int Layout = Eigen::ColMajor>
-  void SumAllMomentaCacheBlocked(Eigen::Tensor<ComplexD, 4, Layout> &result,
-                                 std::array<double, 5> *timings = nullptr,
-                                 std::array<double, 5> *bytesMoved = nullptr)
-  {
-    SumAllMomentaCacheBlocked(result, DefaultCacheBlock, timings, bytesMoved);
-  }
-
-  // bytesMoved: see the comment above SumCacheBlocked() -- same per-tile
-  // accumulation, with the momentum count folded into each tile's element
-  // count (nmom is part of the wide dimension being tiled).
-  template <int Layout = Eigen::ColMajor>
-  void SumAllMomentaCacheBlocked(Eigen::Tensor<ComplexD, 4, Layout> &result,
-                                 int cacheBlock,
-                                 std::array<double, 5> *timings = nullptr,
-                                 std::array<double, 5> *bytesMoved = nullptr)
-  {
-    GridBLAS BLAS;
-    double dt;
-
-    int K     = nxyz * Nsc;
-    int Nwide = nmom * N_j;
-
-    dt = -usecond();
-    BLAS.gemmBatched(GridBLAS_OP_T, GridBLAS_OP_N,
-                     N_i, Nwide, K,
-                     scalar(1.0),
-                     W_ptrs,
-                     LR_mom_ptrs,
-                     scalar(0.0),
-                     EMF_mom_ptrs);
-    BLAS.synchronise();
-    dt += usecond();
-    if (timings) (*timings)[0] += dt;
-
-    int nt_global = result.dimension(0);
-    int nd        = grid->Nd();
-    int lt_start  = grid->LocalStarts()[nd - 1];
-
-    std::vector<scalar> host_emf((size_t)nt * Nwide * N_i);
-    dt = -usecond();
-    acceleratorCopyFromDevice(&EMF_mom_buf[0], host_emf.data(),
-                              (size_t)nt * Nwide * N_i * sizeof(scalar));
-    dt += usecond();
-    if (timings) (*timings)[1] += dt;
-    if (bytesMoved) (*bytesMoved)[1] += (double)nt * Nwide * N_i * sizeof(scalar);
-
-    int lN_j = N_j, lnmom = nmom;
-    for (int ii = 0; ii < N_i; ii += cacheBlock)
-    {
-      int Niii = std::min(N_i - ii, cacheBlock);
-      for (int jj = 0; jj < N_j; jj += cacheBlock)
-      {
-        int Njjj = std::min(N_j - jj, cacheBlock);
-
-        std::vector<scalar> tile((size_t)nt_global * Niii * Njjj * nmom, scalar(0.0));
-        dt = -usecond();
-        thread_for_collapse(4, lt, nt, {
-            for (int iii = 0; iii < Niii; iii++)
-            for (int jjj = 0; jjj < Njjj; jjj++)
-            for (int m = 0; m < lnmom; m++)
-              tile[(((int)lt + lt_start) * Niii * Njjj + iii * Njjj + jjj) * lnmom + m]
-                  = host_emf[(int)lt * (lnmom * lN_j) * N_i
-                             + (m * lN_j + (jj + jjj)) * N_i
-                             + (ii + iii)];
-        });
-        dt += usecond();
-        if (timings) (*timings)[2] += dt;
-        if (bytesMoved) (*bytesMoved)[2] += 2.0 * nt * Niii * Njjj * lnmom * sizeof(scalar);
-
-        dt = -usecond();
-        grid->GlobalSumVector(tile.data(), (size_t)nt_global * Niii * Njjj * nmom);
-        dt += usecond();
-        if (timings) (*timings)[3] += dt;
-        if (bytesMoved) (*bytesMoved)[3] += (double)nt_global * Niii * Njjj * lnmom * sizeof(scalar);
-
-        dt = -usecond();
-        thread_for_collapse(4, gt, nt_global, {
-            for (int iii = 0; iii < Niii; iii++)
-            for (int jjj = 0; jjj < Njjj; jjj++)
-            for (int m = 0; m < lnmom; m++)
-              result((int)gt, ii + iii, jj + jjj, m)
-                  = tile[((int)gt * Niii * Njjj + iii * Njjj + jjj) * lnmom + m];
-        });
-        dt += usecond();
-        if (timings) (*timings)[4] += dt;
-        if (bytesMoved) (*bytesMoved)[4] += 2.0 * nt_global * Niii * Njjj * lnmom * sizeof(scalar);
-      }
-    }
-  }
-
-  // Device-resident variant of SumAllMomentaCacheBlocked. Identical GEMM,
-  // identical tiling, identical result layout and identical numerical
-  // content -- it exists as a separate function purely so the host path
-  // above stays available as an exact regression target. The two differ
-  // only in where the post-GEMM work happens:
-  //
-  //   SumAllMomentaCacheBlocked        SumAllMomentaCacheBlockedDevice
-  //   ---------------------------      -------------------------------
-  //   copy whole GEMM output to host   (nothing)
-  //   per tile: fill on host           per tile: fill on device
-  //             reduce on host                   reduce on device
-  //             scatter to result                copy tile to host
-  //                                              scatter to result
-  //
-  // The host copy therefore moves to the far side of the reduction, and
-  // grows: it used to carry the local slab (nt) once per call, and now
-  // carries the reduced tile at nt_global extent, so the total bytes are
-  // larger by the number of ranks in the time direction. That is still a
-  // good trade because host-device bandwidth sits far above the achievable
-  // rate of the collective, but it is the reason this is not a pure win on
-  // paper and has to be measured.
-  //
-  // timings[] and bytesMoved[] keep the slot meanings documented above
-  // Sum(), with timings[1] reinterpreted as that post-reduction copy.
-  //
-  // CACHEBLOCK CEILING. This hands a device pointer to GlobalSumVector, and
-  // Cray MPICH aborts on device-buffer MPI_Allreduce above roughly 8 MB
-  // (see RingAllReduce.h, which measured 4.4 MB passing and 13.3 MB
-  // failing). The message here is nt_global*cacheBlock^2*nmom*sizeof(scalar),
-  // so cacheBlock must satisfy nt_global*cacheBlock^2*nmom < 524288 for
-  // ComplexD -- about 63 at nt_global=128, nmom=1, and about 12 at nmom=27.
-  // Above that this dies inside MPI rather than returning a wrong answer.
-  // The Ring variant below has no such limit, being point-to-point
-  // throughout; this one is kept as the isolated device-migration
-  // measurement, so it deliberately does not change the collective.
-  template <int Layout = Eigen::ColMajor>
-  void SumAllMomentaCacheBlockedDevice(Eigen::Tensor<ComplexD, 4, Layout> &result,
-                                       int cacheBlock,
-                                       std::array<double, 5> *timings = nullptr,
-                                       std::array<double, 5> *bytesMoved = nullptr)
-  {
-    GridBLAS BLAS;
-    double dt;
-
-    int K     = nxyz * Nsc;
-    int Nwide = nmom * N_j;
-
-    dt = -usecond();
-    BLAS.gemmBatched(GridBLAS_OP_T, GridBLAS_OP_N,
-                     N_i, Nwide, K,
-                     scalar(1.0),
-                     W_ptrs,
-                     LR_mom_ptrs,
-                     scalar(0.0),
-                     EMF_mom_ptrs);
-    BLAS.synchronise();
-    dt += usecond();
-    if (timings) (*timings)[0] += dt;
-
-    int nt_global = result.dimension(0);
-    int nd        = grid->Nd();
-    int lt_start  = grid->LocalStarts()[nd - 1];
-
-    size_t tileMax = (size_t)nt_global * cacheBlock * cacheBlock * nmom;
-    if (tile_buf.size()  < tileMax) tile_buf.resize(tileMax);
-    if (tile_host.size() < tileMax) tile_host.resize(tileMax);
-
-    const scalar *emf_p  = &EMF_mom_buf[0];
-    scalar       *tile_p = &tile_buf[0];
-
-    int lN_i = N_i, lN_j = N_j, lnmom = nmom, lnt = nt, llt_start = lt_start;
-    for (int ii = 0; ii < N_i; ii += cacheBlock)
-    {
-      int Niii = std::min(N_i - ii, cacheBlock);
-      for (int jj = 0; jj < N_j; jj += cacheBlock)
-      {
-        int Njjj = std::min(N_j - jj, cacheBlock);
-
-        size_t tileWords = (size_t)nt_global * Niii * Njjj * nmom;
-        int    lNiii = Niii, lNjjj = Njjj, lii = ii, ljj = jj;
-
-        // One kernel does both the zero-pad and the gather from the GEMM
-        // output. idx runs over the full nt_global tile in exactly the
-        // tile's own index order, so the destination is idx itself
-        // (contiguous, coalesced) and timeslices outside this rank's slab
-        // simply get zero. That folds the host version's zero-fill and fill
-        // into a single pass, and reads EMF_mom_buf in place on the device
-        // rather than through a host copy.
-        dt = -usecond();
-        accelerator_for(idx, tileWords, 1, {
-            uint64_t r   = idx;
-            int      m   = r % lnmom;  r /= lnmom;
-            int      jjj = r % lNjjj;  r /= lNjjj;
-            int      iii = r % lNiii;  r /= lNiii;
-            int      lt  = (int)r - llt_start;
-            scalar   v   = scalar(0.0);
-            if ((lt >= 0) && (lt < lnt)) {
-              v = emf_p[(uint64_t)lt * lnmom * lN_j * lN_i
-                        + (uint64_t)(m * lN_j + (ljj + jjj)) * lN_i
-                        + (lii + iii)];
-            }
-            tile_p[idx] = v;
-        });
-        dt += usecond();
-        if (timings) (*timings)[2] += dt;
-        if (bytesMoved) (*bytesMoved)[2] += (double)(nt + nt_global) * Niii * Njjj * lnmom * sizeof(scalar);
-
-#ifdef ACCELERATOR_AWARE_MPI
-        dt = -usecond();
-        grid->GlobalSumVector(tile_p, (int)tileWords);
-        dt += usecond();
-        if (timings) (*timings)[3] += dt;
-
-        dt = -usecond();
-        acceleratorCopyFromDevice(tile_p, tile_host.data(), tileWords * sizeof(scalar));
-        dt += usecond();
-        if (timings) (*timings)[1] += dt;
-#else
-        // Host bounce: this MPI will not take a device pointer, so stage
-        // the tile down first and reduce the host copy instead. Same single
-        // copy and same byte count as the path above -- only the order of
-        // the two operations differs -- so timings[1] and timings[3] stay
-        // directly comparable between the two.
-        dt = -usecond();
-        acceleratorCopyFromDevice(tile_p, tile_host.data(), tileWords * sizeof(scalar));
-        dt += usecond();
-        if (timings) (*timings)[1] += dt;
-
-        dt = -usecond();
-        grid->GlobalSumVector(tile_host.data(), (int)tileWords);
-        dt += usecond();
-        if (timings) (*timings)[3] += dt;
-#endif
-        if (bytesMoved) (*bytesMoved)[1] += (double)tileWords * sizeof(scalar);
-        if (bytesMoved) (*bytesMoved)[3] += (double)tileWords * sizeof(scalar);
-
-        const scalar *red_p = tile_host.data();
-        dt = -usecond();
-        thread_for_collapse(4, gt, nt_global, {
-            for (int iii = 0; iii < Niii; iii++)
-            for (int jjj = 0; jjj < Njjj; jjj++)
-            for (int m = 0; m < lnmom; m++)
-              result((int)gt, ii + iii, jj + jjj, m)
-                  = red_p[((size_t)gt * Niii * Njjj + iii * Njjj + jjj) * lnmom + m];
-        });
-        dt += usecond();
-        if (timings) (*timings)[4] += dt;
-        if (bytesMoved) (*bytesMoved)[4] += 2.0 * nt_global * Niii * Njjj * lnmom * sizeof(scalar);
-      }
-    }
-  }
-
-  // Split-collective variant: the single padded GlobalSumVector of the
-  // other Sum* functions is replaced by the two operations it was standing
-  // in for, each done with the primitive that matches it.
+  // Split-collective reduction: rather than one padded GlobalSumVector over
+  // the whole communicator, the two operations that call was standing in for
+  // are done separately, each with the primitive that matches it.
   //
   // Post-GEMM this rank's result is incomplete in two independent ways. It
   // is incomplete in K, because the GEMM contracted only over this rank's
@@ -997,31 +435,37 @@ public:
   // buffers to both MPI and accelerator_for, so there is no host-bounce
   // path to fall back to.
   //
-  // GEMM OPERANDS ARE SWAPPED relative to the other Sum* variants -- LR is
-  // A and W is B, with M and N exchanged. Same flops, same K, same nt batch
-  // elements, same numbers; only the storage orientation of each batch's
-  // output changes, from C[i + col*N_i] (i fastest, layout [m][j][i]) to
-  // C[row + i*Nwide] (j fastest, layout [i][m][j]). That turns what was a
-  // full reversal into a contiguous-run gather.
+  // GEMM OPERAND ORDER: LR is A and W is B, so each batch element writes
+  // C[row + i*Nwide] -- j fastest, i.e. the layout [i][m][j]. The other
+  // choice, W as A, writes C[i + col*N_i] ([m][j][i], i fastest), which the
+  // gather below would have to read as a full index reversal; this way it
+  // walks contiguous runs instead. Flops, K, batch count and the numbers
+  // themselves are identical either way -- only the output's storage
+  // orientation differs.
   //
-  // RESULT LAYOUT DIFFERS from SumAllMomentaCacheBlocked: this takes
-  // result[nt_global][N_i][nmom][N_j], nmom BEFORE N_j rather than after.
-  // That is what lets the tile agree with the swapped GEMM and with a
-  // RowMajor result simultaneously, so the scatter stays contiguous on both
-  // sides -- the property the nmom-last ordering was chosen for, preserved
-  // under the new orientation. It also makes the Hadrons IO fill loop
-  // contiguous, since that reads at fixed m and previously strided by nmom.
-  // The on-disk HDF5 layout is unaffected either way.
+  // RESULT LAYOUT: result[nt_global][N_i][nmom][N_j], nmom BEFORE N_j. That
+  // ordering agrees with the GEMM's [i][m][j] output and with a RowMajor
+  // result at the same time, so the scatter is contiguous on both sides. It
+  // also keeps the Hadrons IO fill loop contiguous, since that reads at
+  // fixed m. The on-disk HDF5 layout is unaffected by the choice.
   //
   // timings[]/bytesMoved[] carry six slots here rather than five:
   //   [0] GEMM              [1] device->host
   //   [2] gather to slab    [3] spatial reduce
   //   [4] scatter           [5] temporal gather
+  //
+  // The two comms slots, [3] and [5], are counted as bytes ON THE WIRE, not
+  // as payload: a ring moves each byte many times, so payload over elapsed
+  // time measures the algorithm, while wire over elapsed time measures the
+  // fabric and is the only figure comparable with a link rate or with
+  // Benchmark_allreduce. The GlobalSumVector variants report payload in
+  // their slot [3] because MPI's internal traffic is not knowable from
+  // here, so do not read the two rates against each other.
   template <int Layout = Eigen::ColMajor>
-  void SumAllMomentaCacheBlockedRing(Eigen::Tensor<ComplexD, 4, Layout> &result,
-                                     int cacheBlock,
-                                     std::array<double, 6> *timings = nullptr,
-                                     std::array<double, 6> *bytesMoved = nullptr)
+  void SumRing(Eigen::Tensor<ComplexD, 4, Layout> &result,
+               int cacheBlock,
+               std::array<double, 6> *timings = nullptr,
+               std::array<double, 6> *bytesMoved = nullptr)
   {
     GridBLAS BLAS;
     double dt;
@@ -1082,8 +526,8 @@ public:
         // No zero-pad and no transpose: the swapped GEMM already emits
         // [i][m][j], so this walks contiguous runs of Njjj on both sides.
         // When cacheBlock spans the whole block it degenerates to a
-        // straight copy, and EMF_ptrs could then be aimed at slab_p to drop
-        // it entirely -- left for later so this stays correct for the
+        // straight copy, and EMF_mom_ptrs could then be aimed at slab_p to
+        // drop it entirely -- left for later so this stays correct for the
         // partial-tile case that CPU callers still want.
         dt = -usecond();
         accelerator_for(idx, slabWords, 1, {
@@ -1110,7 +554,7 @@ public:
         CartesianRingAllReduce(grid, slab_p, slabWords, nd - 1);
         dt += usecond();
         if (timings) (*timings)[3] += dt;
-        if (bytesMoved) (*bytesMoved)[3] += (double)slabWords * sizeof(scalar);
+        if (bytesMoved) (*bytesMoved)[3] += wire_ring_reduce * slabWords * sizeof(scalar);
 
         // dim = nd-1 rings the time axis only, so the panel grows from
         // this rank's slab to all Pt slabs and nothing is summed. Legal only
