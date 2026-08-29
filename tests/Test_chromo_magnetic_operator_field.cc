@@ -44,8 +44,11 @@ typedef iSpinMatrix<vector_type>       SpinMatrix_v;
 typedef iSinglet<vector_type>          Scalar_v;
 typedef iSinglet<scalar_type>          Scalar_s;
 typedef Lattice<SpinColourMatrix_v>    PropagatorField;
-typedef LatticeColourMatrix            GaugeMat;
-typedef LatticeGaugeField              GaugeField;
+// Gauge types come from GImpl rather than the default-precision Lattice
+// typedefs, so they cannot drift from FImpl's precision.
+typedef PeriodicGimplD                 GImpl;
+typedef typename GImpl::GaugeLinkField GaugeMat;
+typedef typename GImpl::GaugeField     GaugeField;
 
 // CPU reference, ported from Hadrons/Modules/MContraction/A2AChromoMagneticOperatorField.hpp
 // (M. Tomii). Hadrons infrastructure removed; ifOrthog and parity taken as direct parameters.
@@ -53,14 +56,18 @@ typedef LatticeGaugeField              GaugeField;
 class A2AChromoMagneticOperatorFieldRef
 {
 public:
+  // result is indexed [nt][N_i][m][N_j]. A2ASpatialSum carries a momentum
+  // axis; this contraction projects no momentum, so m has extent 1 and is
+  // always 0.
   static void compute(
-      Eigen::Tensor<ComplexD, 3> &result,
+      Eigen::Tensor<ComplexD, 4> &result,
       const std::vector<FermionField> &left,
       const std::vector<FermionField> &right,
       const GaugeField &U,
       int ifOrthog,
       int parity,
-      bool use_blas = false)
+      bool use_blas = false,
+      int cacheBlock = 12)
   {
     GridBase *grid = left[0].Grid();
 
@@ -168,19 +175,17 @@ public:
       double t_blas_start = usecond();
 
       t0 = usecond();
-      spatial_sum.Allocate(N_i, N_j, grid);
-      std::cout << GridLogMessage << tag << " Allocate:        " << Tms(usecond()-t0) << " ms\n";
-
-      t0 = usecond();
-      spatial_sum.PackLeft(leftv);
-      std::cout << GridLogMessage << tag << " PackLeft:        " << Tms(usecond()-t0) << " ms\n";
-
-      t0 = usecond();
+      spatial_sum.AllocateRight(N_j, grid);
       spatial_sum.PackRight(rightv);
       std::cout << GridLogMessage << tag << " PackRight:       " << Tms(usecond()-t0) << " ms\n";
 
       t0 = usecond();
-      spatial_sum.Sum(result);
+      spatial_sum.AllocateLeft(N_i);
+      spatial_sum.PackLeft(leftv);
+      std::cout << GridLogMessage << tag << " PackLeft:        " << Tms(usecond()-t0) << " ms\n";
+
+      t0 = usecond();
+      spatial_sum.SumRing(result, cacheBlock);
       std::cout << GridLogMessage << tag << " Sum (GEMM+MPI):  " << Tms(usecond()-t0) << " ms\n";
 
       std::cout << GridLogMessage << tag << " A2ASpatialSum:   " << Tms(usecond()-t_blas_start) << " ms  [TOTAL]\n";
@@ -271,183 +276,56 @@ public:
       for (int t  = 0; t  < nt;  t++)
       for (int ii = 0; ii < N_i; ii++)
       for (int jj = 0; jj < N_j; jj++)
-        result(t, ii, jj) = cache[jj + N_j * (ii + N_i * t)];
+        result(t, ii, 0, jj) = cache[jj + N_j * (ii + N_i * t)];
     }
   }
 };
 
 // ================================================================
-// GPU wrapper functions: build field strength tensors per ifOrthog.
-// Not accelerator_for kernels themselves; CloverleafMxN provides
-// the GPU dispatch internally.
-// ================================================================
-
-// ifOrthog=0: spatial-temporal pairs (x,t),(y,t),(z,t) → SigmaXT,SigmaYT,SigmaZT
-void A2ACMOContraction0(std::vector<GaugeMat> &G,
-                         Vector<Gamma::Algebra> &Sigma,
-                         const GaugeField &U)
-{
-  static const int            mus[3]  = {0, 1, 2};
-  static const int            nus[3]  = {3, 3, 3};
-  static const Gamma::Algebra sigs[3] = {
-    Gamma::Algebra::SigmaXT,
-    Gamma::Algebra::SigmaYT,
-    Gamma::Algebra::SigmaZT
-  };
-  G.clear(); G.reserve(3);
-  Sigma.resize(3);
-  for (int idx = 0; idx < 3; ++idx) {
-    GaugeMat Umu(U.Grid()), Unu(U.Grid()), Gmunu(U.Grid());
-    Umu = peekLorentz(U, mus[idx]);
-    Unu = peekLorentz(U, nus[idx]);
-    WilsonLoops<PeriodicGimplD>::CloverleafMxN(Gmunu, Umu, Unu, mus[idx], nus[idx], 1, 1);
-    G.push_back(Gmunu - adj(Gmunu));
-    Sigma[idx] = sigs[idx];
-  }
-}
-
-// ifOrthog=1: spatial-spatial pairs (x,y),(x,z),(y,z) → SigmaXY,SigmaXZ,SigmaYZ
-void A2ACMOContraction1(std::vector<GaugeMat> &G,
-                         Vector<Gamma::Algebra> &Sigma,
-                         const GaugeField &U)
-{
-  static const int            mus[3]  = {0, 0, 1};
-  static const int            nus[3]  = {1, 2, 2};
-  static const Gamma::Algebra sigs[3] = {
-    Gamma::Algebra::SigmaXY,
-    Gamma::Algebra::SigmaXZ,
-    Gamma::Algebra::SigmaYZ
-  };
-  G.clear(); G.reserve(3);
-  Sigma.resize(3);
-  for (int idx = 0; idx < 3; ++idx) {
-    GaugeMat Umu(U.Grid()), Unu(U.Grid()), Gmunu(U.Grid());
-    Umu = peekLorentz(U, mus[idx]);
-    Unu = peekLorentz(U, nus[idx]);
-    WilsonLoops<PeriodicGimplD>::CloverleafMxN(Gmunu, Umu, Unu, mus[idx], nus[idx], 1, 1);
-    G.push_back(Gmunu - adj(Gmunu));
-    Sigma[idx] = sigs[idx];
-  }
-}
-
-// ================================================================
-// GPU kernel: for each right vector, accumulate
-//   loopRight[j](x) = sum_munu G[munu](x) * (parity?Gamma5:1) * Gamma(Sigma[munu]) * right[j](x)
-// G (colour) and Sigma (spin) remain separate; no PropagatorField
-// intermediate — all temporaries are per-thread register SpinColourVectors.
-// ================================================================
-void A2ACMOContractRight(FermionField &loopRight,
-                          const std::vector<GaugeMat> &G,
-                          const Vector<Gamma::Algebra> &Sigma,
-                          const FermionField &right,
-                          int parity)
-{
-  int ng = (int)G.size();
-
-  typedef decltype(G[0].View(AcceleratorRead)) GView;
-  std::vector<GView> gviews;
-  gviews.reserve(ng);
-  for (int munu = 0; munu < ng; ++munu)
-    gviews.push_back(G[munu].View(AcceleratorRead));
-
-  deviceVector<ColourMatrix_v *> gptrs(ng);
-  for (int munu = 0; munu < ng; ++munu)
-    acceleratorPut(gptrs[munu], &gviews[munu][0]);
-
-  autoView(lRv, loopRight, AcceleratorWrite);
-  autoView(rv,  right,     AcceleratorRead);
-
-  const Gamma::Algebra *SigmaPtr = Sigma.data();
-  ColourMatrix_v      **Gptr     = &gptrs[0];
-  int lNg     = ng;
-  int lParity = parity;
-
-  uint64_t oSites = right.Grid()->oSites();
-  int      Nsimd  = SpinColourVector_v::Nsimd();
-
-  accelerator_for(ss, oSites, Nsimd, {
-    typedef decltype(coalescedRead(rv[0])) calcSCVector;
-    auto rightv = rv(ss);
-    calcSCVector lR; lR = Zero();
-    for (int munu = 0; munu < lNg; ++munu) {
-      auto tmp2  = Gamma(SigmaPtr[munu]) * rightv;
-      if (lParity == 1) tmp2 = Gamma(Gamma::Algebra::Gamma5) * tmp2;
-      auto Gmunu = coalescedRead(Gptr[munu][ss]);
-      for (int s = 0; s < Ns; ++s)
-      for (int c = 0; c < Nc; ++c)
-        lR()(s)(c) = lR()(s)(c)
-                   + Gmunu()()(c,0) * tmp2()(s)(0)
-                   + Gmunu()()(c,1) * tmp2()(s)(1)
-                   + Gmunu()()(c,2) * tmp2()(s)(2);
-    }
-    coalescedWrite(lRv[ss], lR);
-  });
-
-  for (int munu = 0; munu < ng; ++munu)
-    gviews[munu].ViewClose();
-}
-
-// ================================================================
-// GPU-offloaded CMO field: accelerator_for right contraction
-// + A2ASpatialSum GEMM spatial reduction.
+// GPU path, driven through A2Autils' own compute() wrapper so the test
+// exercises the production kernels rather than a copy of them. The
+// per-stage lines below come from SumRing's diagnostics; the field-strength
+// and right-contraction stages are inside compute() and are not separately
+// instrumented, which is the price of not duplicating its sequence here.
 // ================================================================
 class A2AChromoMagneticOperatorFieldGPU
 {
 public:
   static void compute(
-      Eigen::Tensor<ComplexD, 3> &result,
+      Eigen::Tensor<ComplexD, 4> &result,
       const std::vector<FermionField> &left,
       const std::vector<FermionField> &right,
       const GaugeField &U,
       int ifOrthog,
-      int parity)
+      int parity,
+      int cacheBlock = 0)
   {
-    GridBase *grid = left[0].Grid();
-    int N_i = (int)left.size();
-    int N_j = (int)right.size();
+    typedef A2AChromoMagneticOperator<GImpl, FImpl> CMO;
 
-    std::string tag = std::string("[gpu  ifOrthog=") + std::to_string(ifOrthog) + " parity=" + std::to_string(parity) + "]";
+    static const char *const sumLabel[6] = {
+      "GEMM           ", "device<->host  ", "gather to slab ",
+      "spatial reduce ", "scatter        ", "temporal gather" };
+
+    std::string tag = std::string("[gpu  ifOrthog=") + std::to_string(ifOrthog)
+                    + " parity=" + std::to_string(parity) + "]";
     auto Tms = [](double us) { return us * 1e-3; };
-    double t0;
 
-    t0 = usecond();
-    std::vector<GaugeMat>  G;
-    Vector<Gamma::Algebra> Sigma;
-    if (ifOrthog == 0) A2ACMOContraction0(G, Sigma, U);
-    else               A2ACMOContraction1(G, Sigma, U);
-    std::cout << GridLogMessage << tag << " field_strength:  " << Tms(usecond()-t0) << " ms\n";
+    std::array<double, 6>             sumT  = {}, sumB = {};
+    std::array<double, CMO::NCompute> compT = {};
 
-    t0 = usecond();
-    for (int munu = 0; munu < (int)G.size(); ++munu) { autoView(gv, G[munu], AcceleratorRead); }
-    for (int j    = 0; j    < N_j;            ++j)   { autoView(rv, right[j], AcceleratorRead); }
-    std::cout << GridLogMessage << tag << " view_open_right: " << Tms(usecond()-t0) << " ms\n";
+    double t0 = usecond();
+    CMO::compute(result, left, right, U, ifOrthog, parity, cacheBlock,
+                 sumT, sumB, compT);
+    double t_tot = usecond() - t0;
 
-    t0 = usecond();
-    std::vector<FermionField> loopRight(N_j, grid);
-    for (int j = 0; j < N_j; j++)
-      A2ACMOContractRight(loopRight[j], G, Sigma, right[j], parity);
-    std::cout << GridLogMessage << tag << " pack_right:      " << Tms(usecond()-t0) << " ms\n";
-
-    A2ASpatialSum<SpinColourVector_v> spatial_sum;
-    double t_blas = usecond();
-
-    t0 = usecond();
-    spatial_sum.Allocate(N_i, N_j, grid);
-    std::cout << GridLogMessage << tag << " Allocate:        " << Tms(usecond()-t0) << " ms\n";
-
-    t0 = usecond();
-    spatial_sum.PackLeftConj(left);
-    std::cout << GridLogMessage << tag << " PackLeftConj:    " << Tms(usecond()-t0) << " ms\n";
-
-    t0 = usecond();
-    spatial_sum.PackRight(loopRight);
-    std::cout << GridLogMessage << tag << " PackRight:       " << Tms(usecond()-t0) << " ms\n";
-
-    t0 = usecond();
-    spatial_sum.Sum(result);
-    std::cout << GridLogMessage << tag << " Sum (GEMM+MPI):  " << Tms(usecond()-t0) << " ms\n";
-
-    std::cout << GridLogMessage << tag << " A2ASpatialSum:   " << Tms(usecond()-t_blas) << " ms  [TOTAL]\n";
+    for (int k = 0; k < CMO::NCompute; k++)
+      std::cout << GridLogMessage << tag << " " << CMO::ComputeLabel[k] << " "
+                << Tms(compT[k]) << " ms\n";
+    for (int k = 0; k < 6; k++)
+      std::cout << GridLogMessage << tag << " " << sumLabel[k] << " "
+                << Tms(sumT[k]) << " ms\n";
+    std::cout << GridLogMessage << tag << " compute:         "
+              << Tms(t_tot) << " ms  [TOTAL]\n";
   }
 };
 
@@ -480,9 +358,11 @@ int main(int argc, char *argv[])
   for (auto &f : right) random(pRNG, f);
   SU<Nc>::HotConfiguration(pRNG, U);
 
-  Eigen::Tensor<ComplexD, 3> result_ref(Nt, N_i, N_j);
-  Eigen::Tensor<ComplexD, 3> result_blas(Nt, N_i, N_j);
-  Eigen::Tensor<ComplexD, 3> result_gpu(Nt, N_i, N_j);
+  // Momentum axis of extent 1 (so the only valid index is 0): no momentum is
+  // projected here, but SumRing indexes result(t, i, m, j) unconditionally.
+  Eigen::Tensor<ComplexD, 4> result_ref(Nt, N_i, 1, N_j);
+  Eigen::Tensor<ComplexD, 4> result_blas(Nt, N_i, 1, N_j);
+  Eigen::Tensor<ComplexD, 4> result_gpu(Nt, N_i, 1, N_j);
   double t_ref = 0, t_blas = 0, t_gpu = 0, start, stop;
 
   // Force GPU initialisation before any timed section
@@ -511,11 +391,11 @@ int main(int argc, char *argv[])
     for (int t  = 0; t  < Nt;  t++)
     for (int ii = 0; ii < N_i; ii++)
     for (int jj = 0; jj < N_j; jj++) {
-      norm2_ref  += norm2(result_ref(t, ii, jj));
-      norm2_blas += norm2(result_blas(t, ii, jj));
-      norm2_gpu  += norm2(result_gpu(t, ii, jj));
-      ComplexD diff_blas = result_ref(t, ii, jj) - result_blas(t, ii, jj);
-      ComplexD diff_gpu  = result_ref(t, ii, jj) - result_gpu(t, ii, jj);
+      norm2_ref  += norm2(result_ref(t, ii, 0, jj));
+      norm2_blas += norm2(result_blas(t, ii, 0, jj));
+      norm2_gpu  += norm2(result_gpu(t, ii, 0, jj));
+      ComplexD diff_blas = result_ref(t, ii, 0, jj) - result_blas(t, ii, 0, jj);
+      ComplexD diff_gpu  = result_ref(t, ii, 0, jj) - result_gpu(t, ii, 0, jj);
       norm2_diff_blas += norm2(diff_blas);
       norm2_diff_gpu  += norm2(diff_gpu);
     }

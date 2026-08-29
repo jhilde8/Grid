@@ -52,10 +52,12 @@ typedef Lattice<SpinColourMatrix_v>    PropagatorField;
 class A2AExtendedMesonFieldRef
 {
 public:
-  // result is indexed [nt][N_i][N_j].
+  // result is indexed [nt][N_i][m][N_j]. A2ASpatialSum carries a momentum
+  // axis; this contraction projects no momentum, so m has extent 1 and is
+  // always 0.
   // use_blas=true replaces the scalar spatial accumulation with A2ASpatialSum.
   static void compute(
-      Eigen::Tensor<ComplexD, 3> &result,
+      Eigen::Tensor<ComplexD, 4> &result,
       const std::vector<FermionField> &left,
       const std::vector<FermionField> &right,
       const std::vector<FermionField> &loop1,
@@ -63,7 +65,8 @@ public:
       const std::vector<Gamma::Algebra> &gamma1,
       const std::vector<Gamma::Algebra> &gamma2,
       int type,
-      bool use_blas = false)
+      bool use_blas = false,
+      int cacheBlock = 12)
   {
     GridBase *grid = left[0].Grid();
 
@@ -263,25 +266,25 @@ public:
 
     if (use_blas) {
       // ------------------------------------------------------------------
-      // BLAS path: A2ASpatialSum (Allocate + PackLeft + PackRight + Sum)
+      // BLAS path: A2ASpatialSum (AllocateRight + PackRight + AllocateLeft
+      // + PackLeft + SumRing). AllocateRight binds the grid, so it and the
+      // right pack come first.
       // ------------------------------------------------------------------
       A2ASpatialSum<SpinColourVector_v> spatial_sum;
       double t_blas_start = usecond();
 
       t0 = usecond();
-      spatial_sum.Allocate(N_i, N_j, grid);
-      std::cout << GridLogMessage << tag << " Allocate:        " << Tms(usecond()-t0) << " ms\n";
-
-      t0 = usecond();
-      spatial_sum.PackLeft(leftv);
-      std::cout << GridLogMessage << tag << " PackLeft:        " << Tms(usecond()-t0) << " ms\n";
-
-      t0 = usecond();
+      spatial_sum.AllocateRight(N_j, grid);
       spatial_sum.PackRight(loopRight);
       std::cout << GridLogMessage << tag << " PackRight:       " << Tms(usecond()-t0) << " ms\n";
 
       t0 = usecond();
-      spatial_sum.Sum(result);
+      spatial_sum.AllocateLeft(N_i);
+      spatial_sum.PackLeft(leftv);
+      std::cout << GridLogMessage << tag << " PackLeft:        " << Tms(usecond()-t0) << " ms\n";
+
+      t0 = usecond();
+      spatial_sum.SumRing(result, cacheBlock);
       std::cout << GridLogMessage << tag << " Sum (GEMM+MPI):  " << Tms(usecond()-t0) << " ms\n";
 
       std::cout << GridLogMessage << tag << " A2ASpatialSum:   " << Tms(usecond()-t_blas_start) << " ms  [TOTAL]\n";
@@ -372,95 +375,66 @@ public:
       for (int t  = 0; t  < nt;  t++)
       for (int ii = 0; ii < N_i; ii++)
       for (int jj = 0; jj < N_j; jj++)
-        result(t, ii, jj) = cache[jj + N_j * (ii + N_i * t)];
+        result(t, ii, 0, jj) = cache[jj + N_j * (ii + N_i * t)];
     }
   }
 };
 
 // ================================================================
-// Drives the real A2AExtendedMesonField<FImpl> kernels from
-// Grid/qcd/utils/A2Autils.h -- LoopPropagator,
-// LoopContractionTypeN, LoopRightContractionTypeN, A2ASpatialSum --
-// with the same per-stage Tms()/tag timing structure as
-// A2AExtendedMesonFieldRef::compute() above, so the ref/blas/gpu
-// paths are directly comparable stage by stage in the log.
-// This calls the real A2Autils.h kernels directly rather than testing
-// a duplicated copy (as this file used to, from before the kernels
-// were ported into A2Autils); it doesn't route through A2Autils.h's
-// own compute() convenience wrapper, since that doesn't expose
-// per-stage timing.
+// GPU path, driven through A2AExtendedMesonField<FImpl>::compute so the
+// test exercises the production sequence rather than a copy of it. Only
+// LoopPropagator stays here, because compute() takes the loop propagator
+// already built.
+//
+// The per-stage lines are SumRing's diagnostics. The tloop and loopRight
+// contractions are inside compute() and are not separately instrumented --
+// the price of not duplicating its sequence here. Both still appear in the
+// ref and blas paths, which time their own.
 // ================================================================
 void A2AExtendedMesonFieldKernels(
-    Eigen::Tensor<ComplexD, 3> &result,
+    Eigen::Tensor<ComplexD, 4> &result,
     const std::vector<FermionField> &left,
     const std::vector<FermionField> &right,
     const std::vector<FermionField> &loop1,
     const std::vector<FermionField> &loop2,
     const std::vector<Gamma::Algebra> &gamma1_in,
     const std::vector<Gamma::Algebra> &gamma2_in,
-    int type)
+    int type,
+    int cacheBlock = 0)
 {
   typedef Grid::A2AExtendedMesonField<FImpl> EMF;
 
+  static const char *const sumLabel[6] = {
+    "GEMM           ", "device<->host  ", "gather to slab ",
+    "spatial reduce ", "scatter        ", "temporal gather" };
+
   GridBase *grid = left[0].Grid();
-  int N_i = (int)left.size();
-  int N_j = (int)right.size();
 
   std::string tag = std::string("[gpu  type=") + std::to_string(type) + "]";
   auto Tms = [](double us) { return us * 1e-3; };
   double t0;
-
-  Vector<Gamma::Algebra> gamma1(gamma1_in.begin(), gamma1_in.end());
-  Vector<Gamma::Algebra> gamma2(gamma2_in.begin(), gamma2_in.end());
 
   t0 = usecond();
   PropagatorField loop(grid);
   EMF::LoopPropagator(loop, loop1, loop2);
   std::cout << GridLogMessage << tag << " loop_build:      " << Tms(usecond()-t0) << " ms\n";
 
-  t0 = usecond();
-  PropagatorField tloop(grid);
-  tloop = Zero();
-  switch (type) {
-  case 0: EMF::LoopContractionType0(tloop, loop);                break;
-  case 1: EMF::LoopContractionType1(tloop, loop, gamma1, gamma2); break;
-  case 2: EMF::LoopContractionType2(tloop, loop, gamma2);         break;
-  case 3: EMF::LoopContractionType3(tloop, loop, gamma1, gamma2); break;
-  }
-  std::cout << GridLogMessage << tag << " tloop:           " << Tms(usecond()-t0) << " ms\n";
+  std::array<double, 6>             sumT  = {}, sumB = {};
+  std::array<double, EMF::NCompute> compT = {};
 
   t0 = usecond();
-  std::vector<FermionField> loopRight(N_j, grid);
-  for (int j = 0; j < N_j; j++) {
-    switch (type) {
-    case 0: EMF::LoopRightContractionType0(loopRight[j], tloop, right[j], gamma1, gamma2); break;
-    case 1: EMF::LoopRightContractionType1(loopRight[j], tloop, right[j]);                 break;
-    case 2: EMF::LoopRightContractionType2(loopRight[j], tloop, right[j], gamma1);         break;
-    case 3: EMF::LoopRightContractionType3(loopRight[j], tloop, right[j]);                 break;
-    }
-  }
-  std::cout << GridLogMessage << tag << " pack_loopright:  " << Tms(usecond()-t0) << " ms\n";
+  EMF::compute(result, left, right, loop, gamma1_in, gamma2_in, type,
+               cacheBlock, sumT, sumB, compT);
+  double t_tot = usecond() - t0;
 
-  A2ASpatialSum<SpinColourVector_v> spatial_sum;
-  double t_blas = usecond();
-
-  t0 = usecond();
-  spatial_sum.Allocate(N_i, N_j, grid);
-  std::cout << GridLogMessage << tag << " Allocate:        " << Tms(usecond()-t0) << " ms\n";
-
-  t0 = usecond();
-  spatial_sum.PackLeftConj(left);
-  std::cout << GridLogMessage << tag << " PackLeftConj:    " << Tms(usecond()-t0) << " ms\n";
-
-  t0 = usecond();
-  spatial_sum.PackRight(loopRight);
-  std::cout << GridLogMessage << tag << " PackRight:       " << Tms(usecond()-t0) << " ms\n";
-
-  t0 = usecond();
-  spatial_sum.SumCacheBlocked(result);
-  std::cout << GridLogMessage << tag << " Sum (GEMM+MPI):  " << Tms(usecond()-t0) << " ms\n";
-
-  std::cout << GridLogMessage << tag << " A2ASpatialSum:   " << Tms(usecond()-t_blas) << " ms  [TOTAL]\n";
+  for (int k = 0; k < EMF::NCompute; k++)
+    std::cout << GridLogMessage << tag << " " << EMF::ComputeLabel[k] << " "
+              << Tms(compT[k]) << " ms\n";
+  for (int k = 0; k < 6; k++)
+    std::cout << GridLogMessage << tag << " " << sumLabel[k] << " "
+              << Tms(sumT[k]) << " ms\n";
+  std::cout << GridLogMessage << tag << " compute:         "
+            << Tms(t_tot) << " ms  [TOTAL]\n";
 }
 
 int main(int argc, char *argv[])
@@ -502,9 +476,11 @@ int main(int argc, char *argv[])
     Gamma::Algebra::GammaT
   };
 
-  Eigen::Tensor<ComplexD, 3> result_ref(Nt, N_i, N_j);
-  Eigen::Tensor<ComplexD, 3> result_blas(Nt, N_i, N_j);
-  Eigen::Tensor<ComplexD, 3> result_gpu(Nt, N_i, N_j);
+  // Momentum axis of extent 1 (so the only valid index is 0): no momentum is
+  // projected here, but SumRing indexes result(t, i, m, j) unconditionally.
+  Eigen::Tensor<ComplexD, 4> result_ref(Nt, N_i, 1, N_j);
+  Eigen::Tensor<ComplexD, 4> result_blas(Nt, N_i, 1, N_j);
+  Eigen::Tensor<ComplexD, 4> result_gpu(Nt, N_i, 1, N_j);
   double t_ref = 0, t_blas = 0, t_gpu = 0, start, stop;
 
   // Force GPU initialisation before any timed section to avoid corrupted type=0 timers.
@@ -535,11 +511,11 @@ int main(int argc, char *argv[])
     for (int t  = 0; t  < Nt;  t++)
     for (int ii = 0; ii < N_i; ii++)
     for (int jj = 0; jj < N_j; jj++) {
-      norm2_ref     += norm2(result_ref(t, ii, jj));
-      norm2_blas    += norm2(result_blas(t, ii, jj));
-      norm2_gpu     += norm2(result_gpu(t, ii, jj));
-      ComplexD diff_blas       = result_ref(t, ii, jj) - result_blas(t, ii, jj);
-      ComplexD diff_gpu        = result_ref(t, ii, jj) - result_gpu(t, ii, jj);
+      norm2_ref     += norm2(result_ref(t, ii, 0, jj));
+      norm2_blas    += norm2(result_blas(t, ii, 0, jj));
+      norm2_gpu     += norm2(result_gpu(t, ii, 0, jj));
+      ComplexD diff_blas       = result_ref(t, ii, 0, jj) - result_blas(t, ii, 0, jj);
+      ComplexD diff_gpu        = result_ref(t, ii, 0, jj) - result_gpu(t, ii, 0, jj);
       norm2_diff_blas       += norm2(diff_blas);
       norm2_diff_gpu        += norm2(diff_gpu);
     }

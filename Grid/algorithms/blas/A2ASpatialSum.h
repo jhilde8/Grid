@@ -142,15 +142,10 @@ public:
     if (LR_buf.size()      < LRsz)        LR_buf.resize(LRsz);
     if (LR_mom_ptrs.size() < (size_t)nt)  LR_mom_ptrs.resize(nt);
 
-    if (nmom > 1) {
-      // No valid default: ApplyAllPhaseRight has to run before the GEMM and
-      // aims the pointers itself. Sizing here keeps the resize out of the
-      // per-gamma inner loop.
-      size_t LRMsz = (size_t)nt * nmom * N_j * nxyz * Nsc;
-      if (LR_mom_buf.size() < LRMsz) LR_mom_buf.resize(LRMsz);
-    } else {
-      PointRightOperand(&LR_buf[0]);
-    }
+    // Only nmom=1 has a meaningful unphased default. Above that,
+    // ApplyAllPhaseRight must run before the GEMM anyway, and it both sizes
+    // LR_mom_buf and aims the pointers.
+    if (nmom == 1) PointRightOperand(&LR_buf[0]);
   }
 
   // AllocateRight must be called first: N_j, nt, nxyz, Nsc and nmom come
