@@ -258,7 +258,11 @@ public:
       int pc = grid->_processor_coor[orthogdim];
 
       t0 = usecond();
-      Vector<ComplexD> cache(nt * N_i * N_j, ComplexD(0.0));
+      // std::vector, not Grid's Vector: Vector is uvmAllocator-backed, and a
+      // UVM pointer handed to MPI trips Cray's GTL pointer classification
+      // (gtlt_hsa_pointer_type). Comms take host or device, never managed --
+      // see the acceleratorIsCommunicable assert in Communicator_mpi3.cc.
+      std::vector<ComplexD> cache(nt * N_i * N_j, ComplexD(0.0));
       for (int lt = 0; lt < ld; lt++)
       for (int pt = 0; pt < pd; pt++) {
         int t = lt + pt * ld;
