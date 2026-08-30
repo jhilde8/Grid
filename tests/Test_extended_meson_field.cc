@@ -283,8 +283,12 @@ public:
       spatial_sum.PackLeft(leftv);
       std::cout << GridLogMessage << tag << " PackLeft:        " << Tms(usecond()-t0) << " ms\n";
 
+      // SumRing has no <=0 guard of its own -- that lives in A2Autils'
+      // compute() -- so normalise here before it steps the tile loop by zero.
+      int cb = (cacheBlock <= 0) ? std::max(N_i, N_j) : cacheBlock;
+
       t0 = usecond();
-      spatial_sum.SumRing(result, cacheBlock);
+      spatial_sum.SumRing(result, cb);
       std::cout << GridLogMessage << tag << " Sum (GEMM+MPI):  " << Tms(usecond()-t0) << " ms\n";
 
       std::cout << GridLogMessage << tag << " A2ASpatialSum:   " << Tms(usecond()-t_blas_start) << " ms  [TOTAL]\n";
@@ -454,11 +458,17 @@ int main(int argc, char *argv[])
   int N_i   = 8;
   int N_j   = 8;
   int Nloop = 4;
+  // Applies to the blas and gpu paths only. The reference keeps its own
+  // default: its cache blocking is for CPU cache locality, where a small
+  // value is what you want, not for collective granularity.
+  int cacheBlock = 0;
 
   if (GridCmdOptionExists(argv, argv+argc, "--Ni"))
     N_i = std::stoi(GridCmdOptionPayload(argv, argv+argc, "--Ni"));
   if (GridCmdOptionExists(argv, argv+argc, "--Nj"))
     N_j = std::stoi(GridCmdOptionPayload(argv, argv+argc, "--Nj"));
+  if (GridCmdOptionExists(argv, argv+argc, "--cacheBlock"))
+    cacheBlock = std::stoi(GridCmdOptionPayload(argv, argv+argc, "--cacheBlock"));
 
   GridParallelRNG pRNG(&grid);
   pRNG.SeedFixedIntegers({1, 2, 3, 4});
@@ -501,13 +511,13 @@ int main(int argc, char *argv[])
     result_blas.setZero();
     start = usecond();
     A2AExtendedMesonFieldRef::compute(result_blas, left, right, loop1, loop2,
-                                      GammaMU, GammaMU, type, true);
+                                      GammaMU, GammaMU, type, true, cacheBlock);
     stop = usecond(); t_blas = stop - start;
 
     result_gpu.setZero();
     start = usecond();
     A2AExtendedMesonFieldKernels(result_gpu, left, right, loop1, loop2,
-                                 GammaMU, GammaMU, type);
+                                 GammaMU, GammaMU, type, cacheBlock);
     stop = usecond(); t_gpu = stop - start;
 
     double norm2_ref = 0.0, norm2_blas = 0.0, norm2_gpu = 0.0;

@@ -376,7 +376,8 @@ int main(int argc, char *argv[])
   std::cout << GridLogMessage << "  N_i         = " << N_i << ", N_j = " << N_j
             << ", nmom = " << nmom << std::endl;
   std::cout << GridLogMessage << "  cacheBlock  = " << cacheBlock
-            << (cacheBlock <= 0 ? "  (one tile)" : "") << std::endl;
+            << (cacheBlock <= 0 ? "  (one tile)" : "")
+            << "  [gpu path; reference fixed at 12]" << std::endl;
   std::cout << GridLogMessage << "  meson field = "
             << (double)nt * N_i * N_j * nmom * sizeof(scalar_type) / 1024. / 1024.
             << " MiB" << std::endl;
