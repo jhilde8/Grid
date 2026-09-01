@@ -94,8 +94,10 @@ public:
   deviceVector<scalar *> EMF_mom_ptrs;
 
   // Staging for SumRing below. tile_buf holds one cacheBlock tile at full
-  // nt_global extent; tile_host is the host landing buffer for the gathered
-  // tile. Sized lazily rather than in Allocate, because nt_global and
+  // nt_global extent. tile_host is the host landing buffer for the scatter
+  // fallback only - the direct path copies into the caller's tensor and never
+  // touches it, so it stays empty for a caller that always takes that path.
+  // Both are sized lazily rather than in Allocate, because nt_global and
   // cacheBlock are only known at the call site.
   deviceVector<scalar>   tile_buf;
   std::vector<scalar>    tile_host;
@@ -449,6 +451,12 @@ public:
   //   [2] gather to slab    [3] spatial reduce
   //   [4] scatter           [5] temporal gather
   //
+  // Slot [4] stays at zero whenever the direct path below applies, which is
+  // the normal case for a caller sizing its tensor per block. It is therefore
+  // the diagnostic for the fast path NOT having engaged: a nonzero scatter
+  // time means some call fell back, either a CPU build tiling the block with
+  // cacheBlock < N_i, or a caller whose tensor shape does not match its block.
+  //
   // The two comms slots, [3] and [5], are counted as bytes ON THE WIRE, not
   // as payload: a ring moves each byte many times, so payload over elapsed
   // time measures the algorithm, while wire over elapsed time measures the
@@ -494,8 +502,45 @@ public:
 
     size_t tileMax = (size_t)nt_global * cacheBlock * cacheBlock * nmom;
 
-    if (tile_buf.size()  < tileMax) tile_buf.resize(tileMax);
-    if (tile_host.size() < tileMax) tile_host.resize(tileMax);
+    if (tile_buf.size() < tileMax) tile_buf.resize(tileMax);
+
+    // The [4] scatter below is a pure relabelling whenever the tile spans the
+    // whole block and the caller's tensor has exactly the tile's shape in
+    // RowMajor: the gathered panel's [gt][iii][m][jjj] layout and a RowMajor
+    // (nt_global, N_i, nmom, N_j) tensor are then the same addresses, so the
+    // device->host copy can land in result.data() and the scatter is skipped.
+    //
+    // result.dimension(1) == N_i does double duty. It is the shape check, and
+    // for a caller that allocates one buffer padded to its largest block and
+    // reuses it for every block, it is also the "this is the partial tail
+    // block" check - the tail's addresses genuinely differ from the padded
+    // tensor's, so it falls back on its own with no extra logic. A caller that
+    // sizes its tensor to each block exactly never takes the fallback.
+    //
+    // cacheBlock < N_i or < N_j means the caller asked for a genuine
+    // sub-rectangle of the block, whose addresses differ as well, so the CPU
+    // path keeps the scatter. Both are runtime conditions, so one binary
+    // serves both builds.
+    //
+    // The scalar check is not cosmetic: result is a ComplexD tensor, and when
+    // vobj carries a single-precision vector_type the scatter's elementwise
+    // assignment is a widening conversion that a raw copy would silently skip.
+    const bool direct = std::is_same<scalar, ComplexD>::value
+                     && (Layout == Eigen::RowMajor)
+                     && (cacheBlock >= N_i) && (cacheBlock >= N_j)
+                     && (result.dimension(1) == N_i)
+                     && (result.dimension(2) == nmom)
+                     && (result.dimension(3) == N_j);
+
+    // Only the fallback needs a host landing buffer, and the tiles that take
+    // it are by construction the small ones, so size it to what this call
+    // actually needs rather than to tileMax.
+    if (!direct)
+    {
+      size_t hostWords = (size_t)nt_global * nmom
+                       * std::min(cacheBlock, N_i) * std::min(cacheBlock, N_j);
+      if (tile_host.size() < hostWords) tile_host.resize(hostWords);
+    }
 
     const scalar *emf_p  = &EMF_mom_buf[0];
     scalar       *tile_p = &tile_buf[0];
@@ -563,24 +608,40 @@ public:
         if (timings) (*timings)[5] += dt;
         if (bytesMoved) (*bytesMoved)[5] += (double)(Pt - 1) * slabWords * sizeof(scalar);
 
-        dt = -usecond();
-        acceleratorCopyFromDevice(tile_p, tile_host.data(), tileWords * sizeof(scalar));
-        dt += usecond();
-        if (timings) (*timings)[1] += dt;
-        if (bytesMoved) (*bytesMoved)[1] += (double)tileWords * sizeof(scalar);
+        if (direct)
+        {
+          // Same addresses on both sides, so the gathered panel already is the
+          // result: land it in the caller's tensor and leave [4] at zero. The
+          // tile is the whole block here, so it is the whole tensor too.
+          GRID_ASSERT((uint64_t)result.size() == tileWords);
 
-        const scalar *red_p = tile_host.data();
-        dt = -usecond();
-        thread_for_collapse(4, gt, nt_global, {
-            for (int iii = 0; iii < Niii; iii++)
-            for (int m   = 0; m   < lnmom; m++)
-            for (int jjj = 0; jjj < Njjj; jjj++)
-              result((int)gt, ii + iii, m, jj + jjj)
-                  = red_p[(((uint64_t)gt * Niii + iii) * lnmom + m) * Njjj + jjj];
-        });
-        dt += usecond();
-        if (timings) (*timings)[4] += dt;
-        if (bytesMoved) (*bytesMoved)[4] += 2.0 * tileWords * sizeof(scalar);
+          dt = -usecond();
+          acceleratorCopyFromDevice(tile_p, result.data(), tileWords * sizeof(scalar));
+          dt += usecond();
+          if (timings) (*timings)[1] += dt;
+          if (bytesMoved) (*bytesMoved)[1] += (double)tileWords * sizeof(scalar);
+        }
+        else
+        {
+          dt = -usecond();
+          acceleratorCopyFromDevice(tile_p, tile_host.data(), tileWords * sizeof(scalar));
+          dt += usecond();
+          if (timings) (*timings)[1] += dt;
+          if (bytesMoved) (*bytesMoved)[1] += (double)tileWords * sizeof(scalar);
+
+          const scalar *red_p = tile_host.data();
+          dt = -usecond();
+          thread_for_collapse(4, gt, nt_global, {
+              for (int iii = 0; iii < Niii; iii++)
+              for (int m   = 0; m   < lnmom; m++)
+              for (int jjj = 0; jjj < Njjj; jjj++)
+                result((int)gt, ii + iii, m, jj + jjj)
+                    = red_p[(((uint64_t)gt * Niii + iii) * lnmom + m) * Njjj + jjj];
+          });
+          dt += usecond();
+          if (timings) (*timings)[4] += dt;
+          if (bytesMoved) (*bytesMoved)[4] += 2.0 * tileWords * sizeof(scalar);
+        }
       }
     }
   }
