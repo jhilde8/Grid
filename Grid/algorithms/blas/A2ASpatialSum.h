@@ -93,12 +93,15 @@ public:
   deviceVector<scalar *> LR_mom_ptrs;
   deviceVector<scalar *> EMF_mom_ptrs;
 
-  // Staging for SumRing below. tile_buf holds one cacheBlock tile at full
-  // nt_global extent. tile_host is the host landing buffer for the scatter
-  // fallback only - the direct path copies into the caller's tensor and never
-  // touches it, so it stays empty for a caller that always takes that path.
-  // Both are sized lazily rather than in Allocate, because nt_global and
-  // cacheBlock are only known at the call site.
+  // Staging for SumRing below. tile_buf holds one cacheBlock tile at the
+  // output's time extent - Pt*nt normally, nt in localT, where the rank keeps
+  // only its own slab and the panel collapses to one slot. tile_host is the
+  // host landing buffer for the scatter fallback only - the direct path copies
+  // into the caller's tensor and never touches it, so it stays empty for a
+  // caller that always takes that path. Both are sized lazily rather than in
+  // Allocate, because the time extent and cacheBlock are only known at the
+  // call site. Both grow monotonically, so a process that ever ran the wide
+  // path keeps the wide buffer.
   deviceVector<scalar>   tile_buf;
   std::vector<scalar>    tile_host;
 
@@ -258,7 +261,7 @@ public:
   // result's layout defaults to ColMajor (Eigen::Tensor's own default);
   // callers whose consumer expects j-fastest (e.g. writing into a RowMajor
   // A2AMatrixSet for HDF5) should pass a RowMajor result -- the scatter's
-  // writes are then contiguous instead of striding by nt_global*N_i per j.
+  // writes are then contiguous instead of striding by nt_out*N_i per j.
   //
   // bytesMoved mirrors timings (slot 0/GEMM is FLOP-bound, not bandwidth-
   // bound, so left untouched) with the bytes handled by that stage, summed
@@ -425,6 +428,18 @@ public:
   // The order is forced: the gather only relays, so it is legal only once
   // every slab is final, which is what the reduce establishes.
   //
+  // localT stops after the reduce. Every rank then holds its own slab and
+  // nothing else, and result carries nt in its time dimension rather than
+  // Pt*nt. That is the whole of the per-timeslice IO path: a caller writing
+  // one file per timeslice only ever writes timeslices it owns, so the
+  // gather - which exists solely to hand every rank a copy of a result that
+  // one rank writes - is pure movement with no consumer. The reduce is not
+  // optional in either mode; it is what makes a slab final.
+  //
+  // Note this is not an IO switch. It changes which collective runs and the
+  // shape of result, so a caller that sets it and then indexes result as if
+  // it held nt_global timeslices reads the wrong data rather than failing.
+  //
   // Both run on point-to-point SendToRecvFrom rather than MPI collectives,
   // which also sidesteps the device-buffer MPI_Allreduce size cliff
   // documented in RingAllReduce.h. As that header assumes, an accelerator
@@ -440,7 +455,9 @@ public:
   // themselves are identical either way -- only the output's storage
   // orientation differs.
   //
-  // RESULT LAYOUT: result[nt_global][N_i][nmom][N_j], nmom BEFORE N_j. That
+  // RESULT LAYOUT: result[nt_out][N_i][nmom][N_j], nmom BEFORE N_j, where
+  // nt_out is Pt*nt normally and nt in localT -- in the latter, t index k is
+  // global timeslice ct*nt + k. That
   // ordering agrees with the GEMM's [i][m][j] output and with a RowMajor
   // result at the same time, so the scatter is contiguous on both sides. It
   // also keeps the Hadrons IO fill loop contiguous, since that reads at
@@ -457,6 +474,10 @@ public:
   // time means some call fell back, either a CPU build tiling the block with
   // cacheBlock < N_i, or a caller whose tensor shape does not match its block.
   //
+  // Slot [5] stays at zero in localT, where the temporal gather is skipped
+  // outright rather than merely being cheap. A nonzero [5] on a caller that
+  // asked for localT means the flag did not reach here.
+  //
   // The two comms slots, [3] and [5], are counted as bytes ON THE WIRE, not
   // as payload: a ring moves each byte many times, so payload over elapsed
   // time measures the algorithm, while wire over elapsed time measures the
@@ -468,7 +489,8 @@ public:
   void SumRing(Eigen::Tensor<ComplexD, 4, Layout> &result,
                int cacheBlock,
                std::array<double, 6> *timings = nullptr,
-               std::array<double, 6> *bytesMoved = nullptr)
+               std::array<double, 6> *bytesMoved = nullptr,
+               bool localT = false)
   {
     GridBLAS BLAS;
     double dt;
@@ -488,27 +510,35 @@ public:
     dt += usecond();
     if (timings) (*timings)[0] += dt;
 
-    int nt_global = result.dimension(0);
-    int nd        = grid->Nd();
-    int ct        = grid->ThisProcessorCoor()[nd - 1];
-    int Pt        = grid->ProcessorGrid()[nd - 1];
+    // The output's time extent: Pt*nt normally, nt in localT. Every sizing
+    // and loop bound below is really this, so it is carried directly rather
+    // than as a separate nt_global -- the one quantity that genuinely needs
+    // the panel's full extent is tileWords, and that is exactly Pt*slabWords.
+    int nt_out = result.dimension(0);
+    int nd     = grid->Nd();
+    int ct     = grid->ThisProcessorCoor()[nd - 1];
+    int Pt     = grid->ProcessorGrid()[nd - 1];
 
     // Everything below indexes slabs by t coordinate, so the slab a rank
     // owns must sit at slot ct. A permuted rank ordering would not fail
     // here, it would silently produce a transposed time axis, so check it
-    // rather than trust it.
+    // rather than trust it. In localT it carries more weight still: it is
+    // what makes result's t index k mean global timeslice ct*nt + k, which
+    // is the number the caller puts in a file name.
     GRID_ASSERT(grid->LocalStarts()[nd - 1] == ct * nt);
-    GRID_ASSERT(nt_global == Pt * nt);
+    GRID_ASSERT(nt_out == (localT ? nt : Pt * nt));
 
-    size_t tileMax = (size_t)nt_global * cacheBlock * cacheBlock * nmom;
+    size_t tileMax = (size_t)nt_out * cacheBlock * cacheBlock * nmom;
 
     if (tile_buf.size() < tileMax) tile_buf.resize(tileMax);
 
     // The [4] scatter below is a pure relabelling whenever the tile spans the
     // whole block and the caller's tensor has exactly the tile's shape in
     // RowMajor: the gathered panel's [gt][iii][m][jjj] layout and a RowMajor
-    // (nt_global, N_i, nmom, N_j) tensor are then the same addresses, so the
+    // (nt_out, N_i, nmom, N_j) tensor are then the same addresses, so the
     // device->host copy can land in result.data() and the scatter is skipped.
+    // This holds in localT too, where the panel is the single reduced slab
+    // and nt_out is nt -- the addresses line up for the same reason.
     //
     // result.dimension(1) == N_i does double duty. It is the shape check, and
     // for a caller that allocates one buffer padded to its largest block and
@@ -537,7 +567,7 @@ public:
     // actually needs rather than to tileMax.
     if (!direct)
     {
-      size_t hostWords = (size_t)nt_global * nmom
+      size_t hostWords = (size_t)nt_out * nmom
                        * std::min(cacheBlock, N_i) * std::min(cacheBlock, N_j);
       if (tile_host.size() < hostWords) tile_host.resize(hostWords);
     }
@@ -559,9 +589,17 @@ public:
         // the slowest index, so this rank's nt timeslices form one
         // contiguous run -- which is what lets the gather treat tile_buf as
         // a panel of equal slots with no repacking.
-        uint64_t slabWords = (uint64_t)nt        * Niii * nmom * Njjj;
-        uint64_t tileWords = (uint64_t)nt_global * Niii * nmom * Njjj;
-        scalar  *slab_p    = tile_p + (uint64_t)ct * slabWords;
+        //
+        // Every difference between the two modes is in these five lines, so
+        // the rest of the body reads as one path. In localT there is no
+        // panel: the rank keeps its own slab and nothing else, so the slab
+        // sits at slot 0 and the output is the slab rather than the panel.
+        // The gather below is the only other place localT appears.
+        uint64_t slabWords = (uint64_t)nt * Niii * nmom * Njjj;
+        uint64_t tileWords = (uint64_t)Pt * slabWords;
+        scalar  *slab_p    = localT ? tile_p : tile_p + (uint64_t)ct * slabWords;
+        scalar  *out_p     = localT ? slab_p : tile_p;
+        uint64_t outWords  = localT ? slabWords : tileWords;
 
         // No zero-pad and no transpose: the swapped GEMM already emits
         // [i][m][j], so this walks contiguous runs of Njjj on both sides.
@@ -602,36 +640,41 @@ public:
         // library allocates a second Pt*slabWords panel internally and copies
         // back into tile_p, which is the price of not carrying a private
         // in-place copy of the same loop.
-        dt = -usecond();
-        CartesianRingAllGather(grid, tile_p, slabWords, nd - 1);
-        dt += usecond();
-        if (timings) (*timings)[5] += dt;
-        if (bytesMoved) (*bytesMoved)[5] += (double)(Pt - 1) * slabWords * sizeof(scalar);
+        if (!localT)
+        {
+          dt = -usecond();
+          CartesianRingAllGather(grid, tile_p, slabWords, nd - 1);
+          dt += usecond();
+          if (timings) (*timings)[5] += dt;
+          if (bytesMoved) (*bytesMoved)[5] += (double)(Pt - 1) * slabWords * sizeof(scalar);
+        }
 
         if (direct)
         {
-          // Same addresses on both sides, so the gathered panel already is the
-          // result: land it in the caller's tensor and leave [4] at zero. The
-          // tile is the whole block here, so it is the whole tensor too.
-          GRID_ASSERT((uint64_t)result.size() == tileWords);
+          // Same addresses on both sides, so what the stages above produced
+          // already is the result -- the gathered panel normally, the reduced
+          // slab in localT: land it in the caller's tensor and leave [4] at
+          // zero. The tile is the whole block here, so it is the whole tensor
+          // too.
+          GRID_ASSERT((uint64_t)result.size() == outWords);
 
           dt = -usecond();
-          acceleratorCopyFromDevice(tile_p, result.data(), tileWords * sizeof(scalar));
+          acceleratorCopyFromDevice(out_p, result.data(), outWords * sizeof(scalar));
           dt += usecond();
           if (timings) (*timings)[1] += dt;
-          if (bytesMoved) (*bytesMoved)[1] += (double)tileWords * sizeof(scalar);
+          if (bytesMoved) (*bytesMoved)[1] += (double)outWords * sizeof(scalar);
         }
         else
         {
           dt = -usecond();
-          acceleratorCopyFromDevice(tile_p, tile_host.data(), tileWords * sizeof(scalar));
+          acceleratorCopyFromDevice(out_p, tile_host.data(), outWords * sizeof(scalar));
           dt += usecond();
           if (timings) (*timings)[1] += dt;
-          if (bytesMoved) (*bytesMoved)[1] += (double)tileWords * sizeof(scalar);
+          if (bytesMoved) (*bytesMoved)[1] += (double)outWords * sizeof(scalar);
 
           const scalar *red_p = tile_host.data();
           dt = -usecond();
-          thread_for_collapse(4, gt, nt_global, {
+          thread_for_collapse(4, gt, nt_out, {
               for (int iii = 0; iii < Niii; iii++)
               for (int m   = 0; m   < lnmom; m++)
               for (int jjj = 0; jjj < Njjj; jjj++)
@@ -640,7 +683,7 @@ public:
           });
           dt += usecond();
           if (timings) (*timings)[4] += dt;
-          if (bytesMoved) (*bytesMoved)[4] += 2.0 * tileWords * sizeof(scalar);
+          if (bytesMoved) (*bytesMoved)[4] += 2.0 * outWords * sizeof(scalar);
         }
       }
     }
