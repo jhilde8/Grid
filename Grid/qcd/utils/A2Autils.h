@@ -2412,14 +2412,14 @@ public:
     dt += usecond();
     computeTimings[0] += dt;
 
+    A2ASpatialSum<SpinColourVector_v> spatial_sum;
+
     dt = -usecond();
     std::vector<deviceVector<scalar_type>> ph_flat(nmom);
     for (int m = 0; m < nmom; m++)
-      A2ASpatialSum<SpinColourVector_v>::PackPhase(grid, ph[m], ph_flat[m]);
+      spatial_sum.PackPhase(grid, ph[m], ph_flat[m]);
     dt += usecond();
     computeTimings[1] += dt;
-
-    A2ASpatialSum<SpinColourVector_v> spatial_sum;
 
     dt = -usecond();
     spatial_sum.AllocateRight(N_j, grid, nmom);

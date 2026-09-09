@@ -105,17 +105,83 @@ public:
   deviceVector<scalar>   tile_buf;
   std::vector<scalar>    tile_host;
 
+  // Site map read by PackVectors: for each (outer site, SIMD lane), the local
+  // timeslice and the spatial index within it. Fixed by the grid alone, so it
+  // is built once and every pack reads it -- see BuildSiteMap.
+  GridBase              *map_grid;
+  deviceVector<int>      t_map;
+  deviceVector<int>      xyz_map;
+
   A2ASpatialSum() : grid(nullptr), N_i(0), N_j(0), nt(0), nxyz(0), Nsc(0), nmom(1),
-                    wire_ring_reduce(0.0) {}
+                    wire_ring_reduce(0.0), map_grid(nullptr) {}
 
   // Aim LR_mom_ptrs at the buffer holding the GEMM's right operand. The
   // per-timeslice stride is nmom*N_j*nxyz*Nsc; when base is LR_buf that is
   // the unphased pack's own stride, LR_buf only ever holding one momentum.
   void PointRightOperand(scalar *base)
   {
-    int lN_j = N_j, lnxyz = nxyz, lNsc = Nsc, lnmom = nmom;
+    std::vector<scalar *> h(nt);
     for (int t = 0; t < nt; t++)
-      acceleratorPut(LR_mom_ptrs[t], base + (size_t)t * lnmom * lN_j * lnxyz * lNsc);
+      h[t] = base + (size_t)t * nmom * N_j * nxyz * Nsc;
+    acceleratorCopyToDevice(&h[0], &LR_mom_ptrs[0], (size_t)nt * sizeof(scalar *));
+  }
+
+  // Precompute the coordinate decode every packer needs: for each (outer site,
+  // SIMD lane), the local timeslice l_t and the spatial index l_xyz within it.
+  // Both are fixed by the grid geometry, so this runs once per grid and
+  // PackVectors and PackPhase both read the result. Without it each launch
+  // re-derived the same answer on device at eight integer divisions per thread,
+  // and a trajectory issues of order a million of them.
+  //
+  // l_t and l_xyz are kept apart rather than fused into one offset because N
+  // sits between them in the address arithmetic,
+  //
+  //     base = ((l_t*N + n)*nxyz + l_xyz)*Nsc
+  //
+  // and N differs between the W_buf pack (N_i) and the LR_buf pack (N_j).
+  // Split, one map serves both and survives every change of block shape --
+  // and PackPhase, which is spatial only, reads xyz_map alone.
+  //
+  // Takes the grid explicitly rather than using the member, so PackPhase can
+  // call it before AllocateRight has bound one.
+  void BuildSiteMap(GridBase *g)
+  {
+    int    osites = g->oSites();
+    int    Nsimd  = vobj::Nsimd();
+    size_t npt    = (size_t)osites * Nsimd;
+
+    if (map_grid == g && t_map.size() == npt) return;
+
+    int nd = g->_ndimension;
+    Coordinate rdimensions = g->_rdimensions;
+    Coordinate ldims       = g->LocalDimensions();
+    Coordinate simd        = g->_simd_layout;
+
+    std::vector<int> t_host(npt), xyz_host(npt);
+    thread_for(sf, osites, {
+      Coordinate ocoor(nd);
+      Lexicographic::CoorFromIndex(ocoor, sf, rdimensions);
+      for (int lane = 0; lane < Nsimd; lane++) {
+        Coordinate icoor(nd), lcoor(nd);
+        Lexicographic::CoorFromIndex(icoor, lane, simd);
+        for (int d = 0; d < nd; d++)
+          lcoor[d] = rdimensions[d] * icoor[d] + ocoor[d];
+
+        int l_t = lcoor[nd - 1];
+        lcoor[nd - 1] = 0;
+        int64_t l_xyz;
+        Lexicographic::IndexFromCoor(lcoor, l_xyz, ldims);
+
+        t_host[sf * Nsimd + lane]   = l_t;
+        xyz_host[sf * Nsimd + lane] = (int)l_xyz;
+      }
+    });
+
+    t_map.resize(npt);
+    xyz_map.resize(npt);
+    acceleratorCopyToDevice(&t_host[0],   &t_map[0],   npt * sizeof(int));
+    acceleratorCopyToDevice(&xyz_host[0], &xyz_map[0], npt * sizeof(int));
+    map_grid = g;
   }
 
   // Binds the grid and everything derived from it, so this runs before
@@ -136,6 +202,8 @@ public:
     nt   = ldims[grid->Nd() - 1];
     nxyz = grid->lSites() / nt;
     Nsc  = sizeof(sobj) / sizeof(scalar);
+
+    BuildSiteMap(grid);
 
     wire_ring_reduce = 0.0;
     for (int d = 0; d < grid->Nd() - 1; d++) {
@@ -166,13 +234,18 @@ public:
     if (W_ptrs.size()       < (size_t)nt) W_ptrs.resize(nt);
     if (EMF_mom_ptrs.size() < (size_t)nt) EMF_mom_ptrs.resize(nt);
 
+    // One transfer per table rather than nt of them. acceleratorPut is
+    // acceleratorCopyToDevice at sizeof(T), so nt of them moved nt*8 bytes in
+    // nt round trips; AllocateLeft runs once per (i,j) block.
     scalar *Wh    = &W_buf[0];
     scalar *EMFMh = &EMF_mom_buf[0];
-    int lN_i = N_i, lN_j = N_j, lnxyz = nxyz, lNsc = Nsc, lnmom = nmom;
+    std::vector<scalar *> W_host(nt), EMF_host(nt);
     for (int t = 0; t < nt; t++) {
-      acceleratorPut(W_ptrs[t],       Wh    + (size_t)t * lN_i * lnxyz * lNsc);
-      acceleratorPut(EMF_mom_ptrs[t], EMFMh + (size_t)t * lnmom * lN_j * lN_i);
+      W_host[t]   = Wh    + (size_t)t * N_i * nxyz * Nsc;
+      EMF_host[t] = EMFMh + (size_t)t * nmom * N_j * N_i;
     }
+    acceleratorCopyToDevice(&W_host[0],   &W_ptrs[0],       (size_t)nt * sizeof(scalar *));
+    acceleratorCopyToDevice(&EMF_host[0], &EMF_mom_ptrs[0], (size_t)nt * sizeof(scalar *));
   }
 
   void PackLeft(const std::vector<Lattice<vobj>> &leftv, int start = 0, int count = -1)
@@ -203,18 +276,21 @@ public:
 public:
   // Pack vecs[start..start+N-1] lattice fields into buf[nt][N][nxyz*Nsc], extracting all SIMD lanes.
   // DoConj=true conjugates each element during extraction (used by PackLeftConj).
+  //
+  // The (l_t, l_xyz) decode is read from the site map instead of being derived
+  // per thread; BuildSiteMap explains why it can be. Addresses and values are
+  // unchanged, so the buffer this fills is bit-identical to the open-coded
+  // version -- a diff against it should be exactly zero, not machine epsilon.
   template<bool DoConj = false>
   void PackVectors(const std::vector<Lattice<vobj>> &vecs, scalar *buf, int N, int start = 0)
   {
-    int nd     = grid->_ndimension;
     int osites = grid->oSites();
     int Nsimd  = vobj::Nsimd();
     int lN     = N;
     int lNsc   = Nsc;
     int lnxyz  = nxyz;
-    Coordinate rdimensions = grid->_rdimensions;
-    Coordinate ldims       = grid->LocalDimensions();
-    Coordinate simd        = grid->_simd_layout;
+    const int *tm = &t_map[0];
+    const int *xm = &xyz_map[0];
 
     for (int n = 0; n < N; n++) {
       autoView(src_v, vecs[start + n], AcceleratorRead);
@@ -225,25 +301,13 @@ public:
 #else
           for (int lane = 0; lane < Nsimd; lane++) {
 #endif
-          Coordinate icoor(nd), ocoor(nd), lcoor(nd);
-          Lexicographic::CoorFromIndex(icoor, lane, simd);
-          Lexicographic::CoorFromIndex(ocoor, sf, rdimensions);
-          for (int d = 0; d < nd; d++)
-            lcoor[d] = rdimensions[d] * icoor[d] + ocoor[d];
-
-          int     l_t = lcoor[nd - 1];
-          Coordinate xyz_coor = lcoor;
-          xyz_coor[nd - 1] = 0;
-          int64_t l_xyz;
-          Lexicographic::IndexFromCoor(xyz_coor, l_xyz, ldims);
+          int64_t idx = (int64_t)sf * Nsimd + lane;
 
           sobj    data   = extractLane(lane, src_v[sf]);
           if constexpr (DoConj) data = conjugate(data);
           scalar *data_s = (scalar *)&data;
 
-          int64_t base = (int64_t)l_t * lN * lnxyz * lNsc
-                       + (int64_t)n   * lnxyz * lNsc
-                       + l_xyz * lNsc;
+          int64_t base = ((int64_t)(tm[idx] * lN + n) * lnxyz + xm[idx]) * lNsc;
           for (int sc = 0; sc < lNsc; sc++)
             buf[base + sc] = data_s[sc];
         }
@@ -273,9 +337,13 @@ public:
   // Unpack a ComplexField phase into a flat array of one scalar per spatial site l_xyz.
   // ph is assumed time-independent; all t-layers write the same value so redundant
   // writes across timeslices are safe.  Mirrors the PackVectors SIMD/SIMT extraction.
+  // Not static any more: it reads the site map, so it needs the instance that
+  // caches it. BuildSiteMap is called here rather than assumed, because callers
+  // pack phases before the first AllocateRight; the guard inside makes it free
+  // once AllocateRight has already built the map for this grid.
   template<class phvobj>
-  static void PackPhase(GridBase *_grid, const Lattice<phvobj> &ph,
-                        deviceVector<scalar> &phase_buf)
+  void PackPhase(GridBase *_grid, const Lattice<phvobj> &ph,
+                 deviceVector<scalar> &phase_buf)
   {
     int nd     = _grid->_ndimension;
     int lnt    = _grid->LocalDimensions()[nd - 1];
@@ -283,12 +351,16 @@ public:
     int osites = _grid->oSites();
     int lNsimd = _grid->Nsimd();
 
+    // The map is indexed sf*vobj::Nsimd() + lane, so a phase field of some
+    // other SIMD width would read past its end.
+    GRID_ASSERT(lNsimd == vobj::Nsimd());
+
+    BuildSiteMap(_grid);
+
     phase_buf.resize(lnxyz);
     scalar *phase_data = &phase_buf[0];
 
-    Coordinate rdimensions = _grid->_rdimensions;
-    Coordinate ldims       = _grid->LocalDimensions();
-    Coordinate simd_layout = _grid->_simd_layout;
+    const int *xm = &xyz_map[0];
 
     autoView(ph_v, ph, AcceleratorRead);
 
@@ -299,20 +371,9 @@ public:
 #else
         for (int lane = 0; lane < lNsimd; lane++) {
 #endif
-        Coordinate icoor(nd), ocoor(nd), lcoor(nd);
-        Lexicographic::CoorFromIndex(icoor, lane, simd_layout);
-        Lexicographic::CoorFromIndex(ocoor, sf, rdimensions);
-        for (int d = 0; d < nd; d++)
-          lcoor[d] = rdimensions[d] * icoor[d] + ocoor[d];
-
-        Coordinate xyz_coor = lcoor;
-        xyz_coor[nd - 1]    = 0;
-        int64_t l_xyz;
-        Lexicographic::IndexFromCoor(xyz_coor, l_xyz, ldims);
-
         auto    ph_site = extractLane(lane, ph_v[sf]);
         scalar *ph_s    = (scalar *)&ph_site;
-        phase_data[l_xyz] = ph_s[0];
+        phase_data[xm[(int64_t)sf * lNsimd + lane]] = ph_s[0];
       }
     });
   }
