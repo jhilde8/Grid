@@ -115,6 +115,35 @@ public:
   A2ASpatialSum() : grid(nullptr), N_i(0), N_j(0), nt(0), nxyz(0), Nsc(0), nmom(1),
                     wire_ring_reduce(0.0), map_grid(nullptr) {}
 
+  // Return every buffer to the allocator, leaving the object as constructed.
+  // The buffers only ever grow, so an owner that outlives its last
+  // contraction -- a Hadrons module, which the VM keeps until the job ends --
+  // would otherwise hold its largest block on the device for good: ~11 GiB
+  // per rank for a 27-momentum A2AMesonField at block 256.
+  //
+  // Same shape as MomentumProject::Deallocate, plus shrink_to_fit: resize(0)
+  // alone keeps the capacity and frees nothing.
+  void Deallocate(void)
+  {
+    grid = nullptr;
+    N_i = 0; N_j = 0;
+    nt = 0; nxyz = 0; Nsc = 0;
+    nmom = 1;
+    wire_ring_reduce = 0.0;
+    map_grid = nullptr;
+    W_buf.resize(0);        W_buf.shrink_to_fit();
+    LR_buf.resize(0);       LR_buf.shrink_to_fit();
+    W_ptrs.resize(0);       W_ptrs.shrink_to_fit();
+    LR_mom_buf.resize(0);   LR_mom_buf.shrink_to_fit();
+    EMF_mom_buf.resize(0);  EMF_mom_buf.shrink_to_fit();
+    LR_mom_ptrs.resize(0);  LR_mom_ptrs.shrink_to_fit();
+    EMF_mom_ptrs.resize(0); EMF_mom_ptrs.shrink_to_fit();
+    tile_buf.resize(0);     tile_buf.shrink_to_fit();
+    tile_host.resize(0);    tile_host.shrink_to_fit();
+    t_map.resize(0);        t_map.shrink_to_fit();
+    xyz_map.resize(0);      xyz_map.shrink_to_fit();
+  }
+
   // Aim LR_mom_ptrs at the buffer holding the GEMM's right operand. The
   // per-timeslice stride is nmom*N_j*nxyz*Nsc; when base is LR_buf that is
   // the unphased pack's own stride, LR_buf only ever holding one momentum.
