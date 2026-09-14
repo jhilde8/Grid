@@ -196,10 +196,10 @@ class BinaryIO {
   }
 
   // Network is big endian
-  static inline void htobe32_v(void *file_object,uint32_t bytes){ be32toh_v(file_object,bytes);} 
-  static inline void htobe64_v(void *file_object,uint32_t bytes){ be64toh_v(file_object,bytes);} 
-  static inline void htole32_v(void *file_object,uint32_t bytes){ le32toh_v(file_object,bytes);} 
-  static inline void htole64_v(void *file_object,uint32_t bytes){ le64toh_v(file_object,bytes);} 
+  static inline void htobe32_v(void *file_object,uint64_t bytes){ be32toh_v(file_object,bytes);}
+  static inline void htobe64_v(void *file_object,uint64_t bytes){ be64toh_v(file_object,bytes);}
+  static inline void htole32_v(void *file_object,uint64_t bytes){ le32toh_v(file_object,bytes);}
+  static inline void htole64_v(void *file_object,uint64_t bytes){ le64toh_v(file_object,bytes);}
 
   static inline void be32toh_v(void *file_object,uint64_t bytes)
   {
