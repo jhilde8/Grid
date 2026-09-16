@@ -60,14 +60,13 @@ public:
   // axis; this contraction projects no momentum, so m has extent 1 and is
   // always 0.
   static void compute(
-      Eigen::Tensor<ComplexD, 4> &result,
+      Eigen::Tensor<ComplexD, 4, Eigen::RowMajor> &result,
       const std::vector<FermionField> &left,
       const std::vector<FermionField> &right,
       const GaugeField &U,
       int ifOrthog,
       int parity,
-      bool use_blas = false,
-      int cacheBlock = 12)
+      bool use_blas = false)
   {
     GridBase *grid = left[0].Grid();
 
@@ -174,22 +173,18 @@ public:
       A2ASpatialSum<SpinColourVector_v> spatial_sum;
       double t_blas_start = usecond();
 
+      spatial_sum.Allocate(grid, 1, N_i, N_j);
+
       t0 = usecond();
-      spatial_sum.AllocateRight(N_j, grid);
       spatial_sum.PackRight(rightv);
       std::cout << GridLogMessage << tag << " PackRight:       " << Tms(usecond()-t0) << " ms\n";
 
       t0 = usecond();
-      spatial_sum.AllocateLeft(N_i);
       spatial_sum.PackLeft(leftv);
       std::cout << GridLogMessage << tag << " PackLeft:        " << Tms(usecond()-t0) << " ms\n";
 
-      // SumRing has no <=0 guard of its own -- that lives in A2Autils'
-      // compute() -- so normalise here before it steps the tile loop by zero.
-      int cb = (cacheBlock <= 0) ? std::max(N_i, N_j) : cacheBlock;
-
       t0 = usecond();
-      spatial_sum.SumRing(result, cb);
+      spatial_sum.SumRing(result);
       std::cout << GridLogMessage << tag << " Sum (GEMM+MPI):  " << Tms(usecond()-t0) << " ms\n";
 
       std::cout << GridLogMessage << tag << " A2ASpatialSum:   " << Tms(usecond()-t_blas_start) << " ms  [TOTAL]\n";
@@ -300,36 +295,35 @@ class A2AChromoMagneticOperatorFieldGPU
 {
 public:
   static void compute(
-      Eigen::Tensor<ComplexD, 4> &result,
+      Eigen::Tensor<ComplexD, 4, Eigen::RowMajor> &result,
       const std::vector<FermionField> &left,
       const std::vector<FermionField> &right,
       const GaugeField &U,
       int ifOrthog,
-      int parity,
-      int cacheBlock = 0)
+      int parity)
   {
     typedef A2AChromoMagneticOperator<GImpl, FImpl> CMO;
 
-    static const char *const sumLabel[6] = {
+    static const char *const sumLabel[5] = {
       "GEMM           ", "device<->host  ", "gather to slab ",
-      "spatial reduce ", "scatter        ", "temporal gather" };
+      "spatial reduce ", "temporal gather" };
 
     std::string tag = std::string("[gpu  ifOrthog=") + std::to_string(ifOrthog)
                     + " parity=" + std::to_string(parity) + "]";
     auto Tms = [](double us) { return us * 1e-3; };
 
-    std::array<double, 6>             sumT  = {}, sumB = {};
+    std::array<double, 5>             sumT  = {}, sumB = {};
     std::array<double, CMO::NCompute> compT = {};
 
     double t0 = usecond();
-    CMO::compute(result, left, right, U, ifOrthog, parity, cacheBlock,
+    CMO::compute(result, left, right, U, ifOrthog, parity,
                  sumT, sumB, compT);
     double t_tot = usecond() - t0;
 
     for (int k = 0; k < CMO::NCompute; k++)
       std::cout << GridLogMessage << tag << " " << CMO::ComputeLabel[k] << " "
                 << Tms(compT[k]) << " ms\n";
-    for (int k = 0; k < 6; k++)
+    for (int k = 0; k < 5; k++)
       std::cout << GridLogMessage << tag << " " << sumLabel[k] << " "
                 << Tms(sumT[k]) << " ms\n";
     std::cout << GridLogMessage << tag << " compute:         "
@@ -349,17 +343,11 @@ int main(int argc, char *argv[])
   int Nt  = latt_size[Tp];
   int N_i = 8;
   int N_j = 8;
-  // Applies to the blas and gpu paths only. The reference keeps its own
-  // default: its cache blocking is for CPU cache locality, where a small
-  // value is what you want, not for collective granularity.
-  int cacheBlock = 0;
 
   if (GridCmdOptionExists(argv, argv+argc, "--Ni"))
     N_i = std::stoi(GridCmdOptionPayload(argv, argv+argc, "--Ni"));
   if (GridCmdOptionExists(argv, argv+argc, "--Nj"))
     N_j = std::stoi(GridCmdOptionPayload(argv, argv+argc, "--Nj"));
-  if (GridCmdOptionExists(argv, argv+argc, "--cacheBlock"))
-    cacheBlock = std::stoi(GridCmdOptionPayload(argv, argv+argc, "--cacheBlock"));
 
   GridParallelRNG pRNG(&grid);
   pRNG.SeedFixedIntegers({1, 2, 3, 4});
@@ -374,9 +362,9 @@ int main(int argc, char *argv[])
 
   // Momentum axis of extent 1 (so the only valid index is 0): no momentum is
   // projected here, but SumRing indexes result(t, i, m, j) unconditionally.
-  Eigen::Tensor<ComplexD, 4> result_ref(Nt, N_i, 1, N_j);
-  Eigen::Tensor<ComplexD, 4> result_blas(Nt, N_i, 1, N_j);
-  Eigen::Tensor<ComplexD, 4> result_gpu(Nt, N_i, 1, N_j);
+  Eigen::Tensor<ComplexD, 4, Eigen::RowMajor> result_ref(Nt, N_i, 1, N_j);
+  Eigen::Tensor<ComplexD, 4, Eigen::RowMajor> result_blas(Nt, N_i, 1, N_j);
+  Eigen::Tensor<ComplexD, 4, Eigen::RowMajor> result_gpu(Nt, N_i, 1, N_j);
   double t_ref = 0, t_blas = 0, t_gpu = 0, start, stop;
 
   // Force GPU initialisation before any timed section
@@ -392,12 +380,12 @@ int main(int argc, char *argv[])
 
     result_blas.setZero();
     start = usecond();
-    A2AChromoMagneticOperatorFieldRef::compute(result_blas, left, right, U, ifOrthog, parity, true, cacheBlock);
+    A2AChromoMagneticOperatorFieldRef::compute(result_blas, left, right, U, ifOrthog, parity, true);
     stop = usecond(); t_blas = stop - start;
 
     result_gpu.setZero();
     start = usecond();
-    A2AChromoMagneticOperatorFieldGPU::compute(result_gpu,  left, right, U, ifOrthog, parity, cacheBlock);
+    A2AChromoMagneticOperatorFieldGPU::compute(result_gpu,  left, right, U, ifOrthog, parity);
     stop = usecond(); t_gpu = stop - start;
 
     double norm2_ref = 0.0, norm2_blas = 0.0, norm2_gpu = 0.0;

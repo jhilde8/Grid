@@ -2042,13 +2042,10 @@ public:
   // compute: GPU extended meson field for one (type, gamma pair).
   //   left   - original left vectors (conjugated during packing)
   //   loop   - pre-built loop propagator (from LoopPropagator)
-  //   result[t][i][m][j] - rank-4 Eigen tensor (nt x N_i x 1 x N_j).
+  //   result[t][i][m][j] - rank-4 RowMajor Eigen tensor (nt x N_i x 1 x N_j).
   //     A2ASpatialSum carries a momentum axis; this contraction projects
   //     no momentum, so that axis has extent 1 and is always indexed 0.
-  //   cacheBlock - reduction tiling granularity; <=0 means one tile. See
-  //     the note above NewMesonField::compute for why, and for the memory
-  //     bound that replaces the old message-size one.
-  //   sumTimings/sumBytesMoved - forwarded to SumRing, its six slots
+  //   sumTimings/sumBytesMoved - forwarded to SumRing, its five slots
   //   computeTimings - this function's own steps, NCompute slots labelled
   //     by ComputeLabel above
   // ----------------------------------------------------------
@@ -2057,18 +2054,16 @@ public:
     "tloop          ", "loop right     ",
     "pack right     ", "pack left      " };
 
-  template <typename TensorType>
   static void compute(
-      TensorType &result,
+      Eigen::Tensor<ComplexD, 4, Eigen::RowMajor> &result,
       const std::vector<FermionField> &left,
       const std::vector<FermionField> &right,
       const PropagatorField &loop,
       const std::vector<Gamma::Algebra> &gamma1_in,
       const std::vector<Gamma::Algebra> &gamma2_in,
       int type,
-      int cacheBlock,
-      std::array<double, 6> &sumTimings,
-      std::array<double, 6> &sumBytesMoved,
+      std::array<double, 5> &sumTimings,
+      std::array<double, 5> &sumBytesMoved,
       std::array<double, NCompute> &computeTimings)
   {
     GridBase *grid = loop.Grid();
@@ -2109,21 +2104,19 @@ public:
     computeTimings[1] += dt;
 
     A2ASpatialSum<SpinColourVector_v> spatial_sum;
+    spatial_sum.Allocate(grid, 1, N_i, N_j);
 
     dt = -usecond();
-    spatial_sum.AllocateRight(N_j, grid);
     spatial_sum.PackRight(loopRight);
     dt += usecond();
     computeTimings[2] += dt;
 
     dt = -usecond();
-    spatial_sum.AllocateLeft(N_i);
     spatial_sum.PackLeftConj(left);
     dt += usecond();
     computeTimings[3] += dt;
 
-    if (cacheBlock <= 0) cacheBlock = std::max(N_i, N_j);
-    spatial_sum.SumRing(result, cacheBlock, &sumTimings, &sumBytesMoved);
+    spatial_sum.SumRing(result, &sumTimings, &sumBytesMoved);
   }
 };
 
@@ -2269,13 +2262,10 @@ public:
   // ----------------------------------------------------------
   // compute: GPU CMO field for one (ifOrthog, parity) pair.
   //   No blocking - processes all N_i x N_j vectors at once.
-  //   result[t][i][m][j] - rank-4 Eigen tensor (nt x N_i x 1 x N_j).
+  //   result[t][i][m][j] - rank-4 RowMajor Eigen tensor (nt x N_i x 1 x N_j).
   //     A2ASpatialSum carries a momentum axis; this contraction projects
   //     no momentum, so that axis has extent 1 and is always indexed 0.
-  //   cacheBlock - reduction tiling granularity; <=0 means one tile. See
-  //     the note above NewMesonField::compute for why, and for the memory
-  //     bound that replaces the old message-size one.
-  //   sumTimings/sumBytesMoved - forwarded to SumRing, its six slots
+  //   sumTimings/sumBytesMoved - forwarded to SumRing, its five slots
   //   computeTimings - this function's own steps, NCompute slots labelled
   //     by ComputeLabel above
   // ----------------------------------------------------------
@@ -2284,17 +2274,15 @@ public:
     "field strength ", "contract right ",
     "pack right     ", "pack left      " };
 
-  template <typename TensorType>
   static void compute(
-      TensorType &result,
+      Eigen::Tensor<ComplexD, 4, Eigen::RowMajor> &result,
       const std::vector<FermionField> &left,
       const std::vector<FermionField> &right,
       const GaugeField &U,
       int ifOrthog,
       int parity,
-      int cacheBlock,
-      std::array<double, 6> &sumTimings,
-      std::array<double, 6> &sumBytesMoved,
+      std::array<double, 5> &sumTimings,
+      std::array<double, 5> &sumBytesMoved,
       std::array<double, NCompute> &computeTimings)
   {
     GridBase *grid = left[0].Grid();
@@ -2319,21 +2307,19 @@ public:
     computeTimings[1] += dt;
 
     A2ASpatialSum<SpinColourVector_v> spatial_sum;
+    spatial_sum.Allocate(grid, 1, N_i, N_j);
 
     dt = -usecond();
-    spatial_sum.AllocateRight(N_j, grid);
     spatial_sum.PackRight(loopRight);
     dt += usecond();
     computeTimings[2] += dt;
 
     dt = -usecond();
-    spatial_sum.AllocateLeft(N_i);
     spatial_sum.PackLeftConj(left);
     dt += usecond();
     computeTimings[3] += dt;
 
-    if (cacheBlock <= 0) cacheBlock = std::max(N_i, N_j);
-    spatial_sum.SumRing(result, cacheBlock, &sumTimings, &sumBytesMoved);
+    spatial_sum.SumRing(result, &sumTimings, &sumBytesMoved);
   }
 };
 
@@ -2363,7 +2349,7 @@ public:
   typedef iSpinColourVector<vector_type> SpinColourVector_v;
 
   // This function's own steps, reported through computeTimings. SumRing's
-  // six slots keep their own arrays.
+  // five slots keep their own arrays.
   static constexpr int NCompute = 5;
   static constexpr const char *ComputeLabel[NCompute] = {
     "gamma right    ", "phases         ", "pack right     ",
@@ -2373,29 +2359,23 @@ public:
   // compute: GPU meson field for one gamma, all momenta at once.
   //   No blocking - processes all N_i x N_j vectors at once.
   //   ph[m]              - momentum phase field for momentum m
-  //   result[t][i][m][j] - rank-4 Eigen tensor (nt x N_i x nmom x N_j),
-  //                        the layout SumRing expects: m before j, so that
-  //                        a RowMajor result reads contiguously in j at
-  //                        fixed m, which is how the IO fill walks it
-  //   cacheBlock - reduction tiling granularity; <=0 means one tile, which
-  //     is what the ring reduction wants: it has no message-size cliff, so
-  //     fewer and larger collectives is strictly better. Bounded by memory
-  //     rather than by MPI -- the staging tile is nt_global*cacheBlock^2*nmom
-  //     elements, so a large block needs a smaller value.
-  //   sumTimings/sumBytesMoved - forwarded to SumRing, its six slots
+  //   result[t][i][m][j] - rank-4 RowMajor Eigen tensor
+  //                        (nt x N_i x nmom x N_j), the layout SumRing
+  //                        expects: m before j, so the result reads
+  //                        contiguously in j at fixed m, which is how the
+  //                        IO fill walks it
+  //   sumTimings/sumBytesMoved - forwarded to SumRing, its five slots
   //   computeTimings - this function's own steps, NCompute slots labelled
   //     by ComputeLabel above
   // ----------------------------------------------------------
-  template <typename TensorType>
   static void compute(
-      TensorType &result,
+      Eigen::Tensor<ComplexD, 4, Eigen::RowMajor> &result,
       const std::vector<FermionField> &left,
       const std::vector<FermionField> &right,
       const std::vector<ComplexField> &ph,
       Gamma::Algebra g,
-      int cacheBlock,
-      std::array<double, 6> &sumTimings,
-      std::array<double, 6> &sumBytesMoved,
+      std::array<double, 5> &sumTimings,
+      std::array<double, 5> &sumBytesMoved,
       std::array<double, NCompute> &computeTimings)
   {
     GridBase *grid = left[0].Grid();
@@ -2413,33 +2393,31 @@ public:
     computeTimings[0] += dt;
 
     A2ASpatialSum<SpinColourVector_v> spatial_sum;
+    spatial_sum.Allocate(grid, nmom, N_i, N_j);
 
     dt = -usecond();
     std::vector<deviceVector<scalar_type>> ph_flat(nmom);
     for (int m = 0; m < nmom; m++)
-      spatial_sum.PackPhase(grid, ph[m], ph_flat[m]);
+      spatial_sum.PackPhase(ph[m], ph_flat[m]);
     dt += usecond();
     computeTimings[1] += dt;
 
     dt = -usecond();
-    spatial_sum.AllocateRight(N_j, grid, nmom);
     spatial_sum.PackRight(gammaRight);
     dt += usecond();
     computeTimings[2] += dt;
 
     dt = -usecond();
-    spatial_sum.ApplyAllPhaseRight(ph_flat);
+    spatial_sum.ApplyPhaseRight(ph_flat);
     dt += usecond();
     computeTimings[3] += dt;
 
     dt = -usecond();
-    spatial_sum.AllocateLeft(N_i);
     spatial_sum.PackLeftConj(left);
     dt += usecond();
     computeTimings[4] += dt;
 
-    if (cacheBlock <= 0) cacheBlock = std::max(N_i, N_j);
-    spatial_sum.SumRing(result, cacheBlock, &sumTimings, &sumBytesMoved);
+    spatial_sum.SumRing(result, &sumTimings, &sumBytesMoved);
   }
 };
 

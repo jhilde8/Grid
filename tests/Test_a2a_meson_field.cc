@@ -61,15 +61,13 @@ See the full license in the file "LICENSE" in the top level distribution directo
   passes to PackRight/PackLeftConj, and the IO fill. Those are module-level
   concerns, tested Hadrons-side.
 
-  The two paths deliberately run at different cacheBlock -- the reference at
-  the module's own default, the contraction at one tile -- so the comparison
-  also exercises the tiling being irrelevant to the answer.
+  The reference keeps A2AFewMesonField's own cache tiling (cacheBlock 12),
+  while the contraction reduces each block whole, so the comparison also
+  exercises the tiling being irrelevant to the answer.
 
   Usage:
     Test_a2a_meson_field --grid 16.16.16.32 --mpi 1.1.1.4 \
-                         --Ni 8 --Nj 8 --nmom 2 --cacheBlock 0
-
-  cacheBlock <= 0 selects one tile for the contraction path.
+                         --Ni 8 --Nj 8 --nmom 2
 */
 
 #include <Grid/Grid.h>
@@ -93,9 +91,9 @@ typedef Eigen::Tensor<ComplexD, 4, Eigen::RowMajor> ResultTensor;
 
 static inline double Tms(double us) { return us * 1e-3; }
 
-static const char *const Label6[6] = {
+static const char *const Label5[5] = {
   "GEMM           ", "device<->host  ", "gather to slab ",
-  "spatial reduce ", "scatter        ", "temporal gather" };
+  "spatial reduce ", "temporal gather" };
 
 // Prints the SumRing stage breakdown in the same tagged form as the stages
 // above, with each slot reduced across ranks.
@@ -359,7 +357,6 @@ int main(int argc, char *argv[])
   int N_i        = OptInt(argv, argv + argc, "--Ni",         8);
   int N_j        = OptInt(argv, argv + argc, "--Nj",         8);
   int nmom       = OptInt(argv, argv + argc, "--nmom",       2);
-  int cacheBlock = OptInt(argv, argv + argc, "--cacheBlock", 0);
 
   GRID_ASSERT(N_i > 0 && N_j > 0 && nmom > 0);
 
@@ -375,9 +372,6 @@ int main(int argc, char *argv[])
             << ", ranks in time = " << Pt << std::endl;
   std::cout << GridLogMessage << "  N_i         = " << N_i << ", N_j = " << N_j
             << ", nmom = " << nmom << std::endl;
-  std::cout << GridLogMessage << "  cacheBlock  = " << cacheBlock
-            << (cacheBlock <= 0 ? "  (one tile)" : "")
-            << "  [gpu path; reference fixed at 12]" << std::endl;
   std::cout << GridLogMessage << "  meson field = "
             << (double)nt * N_i * N_j * nmom * sizeof(scalar_type) / 1024. / 1024.
             << " MiB" << std::endl;
@@ -424,14 +418,14 @@ int main(int argc, char *argv[])
 
   typedef NewMesonField<FImpl> MF;
 
-  std::array<double, 6>            sumT  = {}, sumB = {};
+  std::array<double, 5>            sumT  = {}, sumB = {};
   std::array<double, MF::NCompute> compT = {}, compB = {};   // no byte counts
   start = usecond();
-  MF::compute(result_gpu, left, right, ph, gamma, cacheBlock, sumT, sumB, compT);
+  MF::compute(result_gpu, left, right, ph, gamma, sumT, sumB, compT);
   double t_gpu = usecond() - start;
 
   ReportStages(&grid, "[gpu]", "compute:       ", compT, compB, MF::ComputeLabel);
-  ReportStages(&grid, "[gpu]", "SumRing:       ", sumT,  sumB,  Label6);
+  ReportStages(&grid, "[gpu]", "SumRing:       ", sumT,  sumB,  Label5);
 
   double norm2_ref = 0.0, norm2_gpu = 0.0, norm2_diff = 0.0;
   for (int t = 0; t < nt;   t++)
