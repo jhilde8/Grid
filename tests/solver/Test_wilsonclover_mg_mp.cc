@@ -60,7 +60,7 @@ int main(int argc, char **argv) {
   RealD csw_r = 1.0;
   RealD csw_t = 1.0;
 
-  MultiGridParams mgParams;
+  WilsonMGParams mgParams;
   std::string     inputXml{"./mg_params.xml"};
 
   if(GridCmdOptionExists(argv, argv + argc, "--inputxml")) {

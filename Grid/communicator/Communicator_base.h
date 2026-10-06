@@ -38,6 +38,7 @@ Author: Peter Boyle <paboyle@ph.ed.ac.uk>
 NAMESPACE_BEGIN(Grid);
 
 extern bool Stencil_force_mpi ;
+extern bool Stencil_force_barrier ;
 
 class CartesianCommunicator : public SharedMemory {
 
@@ -132,6 +133,7 @@ public:
 
   template<class obj> void GlobalSumP2P(obj &o)
   {
+    GRID_TRACE("GlobalSumP2P");
     std::vector<obj> column;
     obj accum = o;
     int source,dest;

@@ -244,7 +244,7 @@ int main(int argc, char **argv)
   // T7 : the SAME shape as T6, but assembled by C sequential MPI_Bcast --
   // one broadcast per contributing rank -- instead of one MPI_Allgatherv.
   //
-  // This is the transport of DENSE_GATHER=2.  Bcast takes no count vector,
+  // This is the transport of the retired chunked-Bcast gather.  Bcast takes no count vector,
   // so the zero-count asymmetry that makes T6 run at ~0.18 MB/s and trip
   // mpir_request.h:508 cannot arise.  It costs C collectives rather than 1
   // and the roots do not transmit concurrently, so the byte cost is about

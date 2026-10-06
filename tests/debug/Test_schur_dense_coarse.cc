@@ -27,25 +27,19 @@ Author: Peter Boyle <pboyle@bnl.gov>
 /*  END LEGAL */
 
 //
-// T6 of the RecursiveSchurInverse regression chain
-// (schur_recursive_inverse_plan.txt 4B.5): the DenseCoarseMatrix GLUE,
-// on a real (tiny) lattice coarse operator, CPU laptop build.
+// The DenseCoarseMatrix GLUE test, on a real (tiny) lattice coarse
+// operator, CPU laptop build.
 //
-// Builds a genuine GeneralCoarsenedMatrix (DWF MdagM + 0.5 shift for a
-// guaranteed-invertible Galerkin coarse op, random aggregation basis,
-// nbasis=8, 4^4 x Ls/1 blocking) and constructs DenseCoarseMatrix in
-// DENSE_SCHUR=2 AUDIT mode with small DENSE_PANEL_BYTES (multi-panel
-// gathers exercised through the glue).  The constructor then runs, in
-// order, all the certificates this stage exists to check:
-//   - fresh ImportDense (no SLAB_FILE) + IMPORT CERTIFICATE vs Op.M
-//   - InvertDenseSingle (the oracle)
-//   - InvertDenseSchur: self-certifying rank-major map, fp64 diagonal
-//     import certificate vs the fp32 slab, distributed recursion,
-//     growth telemetry
-//   - AUDIT: max|Ainv_schur - Ainv_single| over the full slab
-//   - VERIFY ||A Ainv x - x||/||x|| through the SCHUR result
-// This program adds asserts on the audit number and a random-vector
-// round trip.
+// Builds a genuine DeprecatedGeneralCoarsenedMatrix (DWF MdagM + 0.5 shift for a
+// guaranteed-invertible Galerkin coarse op, random aggregation basis)
+// and runs the whole Import certificate chain through the glue:
+//   - fresh ImportDense + IMPORT CERTIFICATE vs Op.M
+//   - fp64 rank-major import certificate vs the fp32 slab
+//   - the 2D block-cyclic recursion + growth telemetry
+//   - VERIFY ||A Ainv x - x||/||x|| through the device split-K apply
+// This program adds an INDEPENDENT Eigen fp64 host-inverse oracle at
+// small N (built from applies of M to unit vectors, so it shares no
+// code with the import) and a random-vector round trip.
 //
 // Uniform local volume 12.12.12.12 (fine), per-dim blocks {4,4,3,3},
 // coarse 3.3.4.4/rank, nbasis 4 (N = 576n):
@@ -149,7 +143,7 @@ int main (int argc, char ** argv)
   Aggregates.CreateSubspaceRandom(RNG5);
 
   std::cout << GridLogMessage << "Coarsening shifted MdagM" << std::endl;
-  typedef GeneralCoarsenedMatrix<vSpinColourVector,vTComplex,nbasis> LittleDiracOperator;
+  typedef DeprecatedGeneralCoarsenedMatrix<vSpinColourVector,vTComplex,nbasis> LittleDiracOperator;
   typedef LittleDiracOperator::CoarseVector CoarseVector;
   NextToNextToNextToNearestStencilGeometry5D geom(Coarse5d);
   LittleDiracOperator LittleDiracOp(geom,FGrid,Coarse5d);
@@ -193,13 +187,18 @@ int main (int argc, char ** argv)
 
   ///////////////////////////////////////////////////////////////////////
   // Full-matrix conditioning probe at small N: dense columns by
-  // applying M to unit vectors, fp64 Eigen SVD.
+  // applying M to unit vectors, fp64 Eigen SVD.  eA is kept: it is the
+  // INDEPENDENT oracle for the inverse below (built from applies of M,
+  // sharing no code with the stencil->dense import).
   ///////////////////////////////////////////////////////////////////////
+  int64_t Nprobe = Coarse5d->gSites() * nbasis;
+  Eigen::MatrixXcd eA;
+  bool haveOracle = false;
   {
-    int64_t Nprobe = Coarse5d->gSites() * nbasis;
     if ( Nprobe <= 700 )
     {
-      Eigen::MatrixXcd eA(Nprobe, Nprobe);
+      eA.resize(Nprobe, Nprobe);
+      haveOracle = true;
       CoarseVector e(Coarse5d);
       CoarseVector Me(Coarse5d);
       for(int64_t j=0; j<Nprobe; j++)
@@ -255,26 +254,15 @@ int main (int argc, char ** argv)
   }
 
   ///////////////////////////////////////////////////////////////////////
-  // T6: AUDIT mode, fresh import, multi-panel gathers.  The constructor
-  // runs every certificate in the chain (see banner).
+  // The glue under test: Import runs the whole certificate chain
+  // (import certificate, fp64 certificate, 2D inverse, VERIFY).
   ///////////////////////////////////////////////////////////////////////
-  setenv("DENSE_SCHUR","2",1);
-  setenv("DENSE_PANEL_BYTES","65536",1);
-  unsetenv("SLAB_FILE");
-
-  // Restructured interface: DenseCoarseMatrix<CComplex,nbasis>, constructed
-  // on the grid and fed by Import (which runs the certificate chain).
   typedef DenseCoarseMatrix<vTComplex,nbasis> DenseCC;
   DenseCC dcm(Coarse5d);
   dcm.Import(LittleDiracOp);
 
-  std::cout << GridLogMessage << "T6  audit relative slab difference (schur vs single) = "
-            << dcm.schurAuditRel << std::endl;
-  GRID_ASSERT( dcm.schurAuditRel >= 0.0 );      // audit actually ran
-  GRID_ASSERT( dcm.schurAuditRel <  1.0e-3 );
-
   ///////////////////////////////////////////////////////////////////////
-  // Random-vector round trip through the SCHUR inverse
+  // Random-vector round trip through the inverse
   ///////////////////////////////////////////////////////////////////////
   CoarseVector x(Coarse5d);
   CoarseVector y(Coarse5d);
@@ -287,6 +275,38 @@ int main (int argc, char ** argv)
   std::cout << GridLogMessage << "T6  round trip ||A Ainv x - x||/||x|| (random x) = "
             << rel << std::endl;
   GRID_ASSERT( rel < 1.0e-2 );
+
+  ///////////////////////////////////////////////////////////////////////
+  // Independent oracle at small N: y from dcm must match the Eigen fp64
+  // solve of eA (dense columns of M itself) on the same x.  Catches an
+  // inverse that is self-consistent with a WRONG import, which the round
+  // trip above cannot (dense and M would share the error).
+  ///////////////////////////////////////////////////////////////////////
+  if ( haveOracle )
+  {
+    Eigen::VectorXcd xs(Nprobe), ys(Nprobe);
+    typedef typename CoarseVector::vector_object::scalar_object csobj;
+    for(int64_t j=0; j<Nprobe; j++)
+    {
+      int64_t gsite = j / nbasis;
+      int     b     = j % nbasis;
+      Coordinate gcoor(Coarse5d->_ndimension);
+      Lexicographic::CoorFromIndex(gcoor, gsite, Coarse5d->GlobalDimensions());
+      csobj s;
+      peekSite(s, x, gcoor);
+      ComplexD zz = ((ComplexD *)&s)[b];
+      xs(j) = std::complex<double>(zz.real(), zz.imag());
+      peekSite(s, y, gcoor);
+      zz = ((ComplexD *)&s)[b];
+      ys(j) = std::complex<double>(zz.real(), zz.imag());
+    }
+    Eigen::VectorXcd yref = eA.fullPivLu().solve(xs);
+    double dev  = (ys - yref).cwiseAbs().maxCoeff();
+    double ymax = yref.cwiseAbs().maxCoeff();
+    std::cout << GridLogMessage << "T6  oracle max|Ainv x - eigen solve|/max|y| = "
+              << dev/ymax << "   (fp32 slab vs fp64 host solve)" << std::endl;
+    GRID_ASSERT( dev/ymax < 1.0e-4 );
+  }
 
   std::cout << GridLogMessage << "Test_schur_dense_coarse: T6 ALL PASS" << std::endl;
 

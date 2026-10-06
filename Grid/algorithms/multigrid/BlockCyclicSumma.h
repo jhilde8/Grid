@@ -71,7 +71,7 @@ class BlockCyclicMatrix
 public:
   GridBase              *grid;      // borrowed, never owned
   BlockCyclicLayout      layout;
-  deviceVector<ComplexD> data;      // column major, ld = layout.mloc
+  deviceVector<DenseInverseScalar> data;      // column major, ld = layout.mloc
 
   BlockCyclicMatrix(GridBase *g, int64_t N, int64_t nb, int Pr, int Pc)
     : grid(g),
@@ -82,7 +82,7 @@ public:
     data.resize( sz ? sz : 1 );
   }
 
-  ComplexD *LocalWindow(int64_t li, int64_t lj)
+  DenseInverseScalar *LocalWindow(int64_t li, int64_t lj)
   {
     return &data[0] + li + lj*layout.mloc;
   }
@@ -93,32 +93,32 @@ public:
   // oracle only; production data enters through the direct block-cyclic
   // import, never through these.
   /////////////////////////////////////////////////////////////////////////
-  void ImportGlobal(const std::vector<ComplexD> &G)
+  void ImportGlobal(const std::vector<DenseInverseScalar> &G)
   {
     int64_t N = layout.N;
     GRID_ASSERT( (int64_t)G.size() == N*N );
-    std::vector<ComplexD> h((uint64_t)layout.mloc*layout.nloc, ComplexD(0.0,0.0));
+    std::vector<DenseInverseScalar> h((uint64_t)layout.mloc*layout.nloc, DenseInverseScalar(0.0,0.0));
     for(int64_t j=0;j<N;j++){
       for(int64_t i=0;i<N;i++){
         if ( layout.Owns(i,j) ) h[layout.LocalOffset(i,j)] = G[i + j*N];
       }
     }
     if ( h.size() )
-      acceleratorCopyToDevice(&h[0], &data[0], h.size()*sizeof(ComplexD));
+      acceleratorCopyToDevice(&h[0], &data[0], h.size()*sizeof(DenseInverseScalar));
   }
-  void ExportGlobal(std::vector<ComplexD> &G)
+  void ExportGlobal(std::vector<DenseInverseScalar> &G)
   {
     int64_t N = layout.N;
-    G.assign((uint64_t)N*N, ComplexD(0.0,0.0));
-    std::vector<ComplexD> h((uint64_t)layout.mloc*layout.nloc);
+    G.assign((uint64_t)N*N, DenseInverseScalar(0.0,0.0));
+    std::vector<DenseInverseScalar> h((uint64_t)layout.mloc*layout.nloc);
     if ( h.size() )
-      acceleratorCopyFromDevice(&data[0], &h[0], h.size()*sizeof(ComplexD));
+      acceleratorCopyFromDevice(&data[0], &h[0], h.size()*sizeof(DenseInverseScalar));
     for(int64_t j=0;j<N;j++){
       for(int64_t i=0;i<N;i++){
         if ( layout.Owns(i,j) ) G[i + j*N] = h[layout.LocalOffset(i,j)];
       }
     }
-    if ( N ) grid->GlobalSumVector((ComplexD *)&G[0], (int)(N*N)); // zero-fill: exact
+    if ( N ) grid->GlobalSumVector((DenseInverseScalar *)&G[0], (int)(N*N)); // zero-fill: exact
   }
 };
 
@@ -139,31 +139,27 @@ public:
   // per message: measured 1.26 GB/s/rank on 13 MB ring messages (production,
   // GRID_ALLOC_NCACHE_LARGE=64) against 62 s total for the same inverse when
   // hipMalloc returned a stable address.
-  deviceVector<ComplexD> Abuf;
-  deviceVector<ComplexD> Bbuf;
+  deviceVector<DenseInverseScalar> Abuf;
+  deviceVector<DenseInverseScalar> Bbuf;
   double   tAlloc=0, tPack=0, tRingA=0, tRingB=0, tGemm=0;
   uint64_t bytesRing=0, nRingMsg=0, nMultiply=0, nGemm=0;
   // Per-message-size histogram (bucket = floor(log2 bytes)): count, bytes,
   // microseconds -- decomposes the ring time by packet size so a low average
   // GB/s can be attributed (many small latency-bound messages vs slow large
-  // ones vs partner-wait).  The 8 MB probe runs at 11-20 GB/s; SUMMA averaged 2.
+  // ones vs partner-wait).  Time is wall time inside SendToRecvFrom, so a
+  // bucket far below the wire rate for its size is wait, not wire.
   static const int NHIST=48;
-  uint64_t histN[NHIST]={0}, histBytes[NHIST]={0}; double histUs[NHIST]={0}, histHsUs[NHIST]={0};
-  // SUMMA_HANDSHAKE=1: a 4-byte SendToRecvFrom with the same partner
-  // immediately before each ring message, timed separately (histHsUs).
-  // Handshake time = partner-arrival skew; the remainder = transfer.  Splits
-  // the [2,4) MB bucket's 12 ms/msg (2026-08-27) into wait vs wire.
-  int handshake = -1; int hsTx=0, hsRx=0;
-  void HistAdd(uint64_t bytes, double us, double hs=0.0){ int b=0; while((bytes>>b)>1) b++; histN[b]++; histBytes[b]+=bytes; histUs[b]+=us; histHsUs[b]+=hs; }
-  void ResetTelemetry(void){ tAlloc=tPack=tRingA=tRingB=tGemm=0; bytesRing=nRingMsg=nMultiply=nGemm=0; for(int b=0;b<NHIST;b++){histN[b]=histBytes[b]=0; histUs[b]=histHsUs[b]=0;} }
+  uint64_t histN[NHIST]={0}, histBytes[NHIST]={0}; double histUs[NHIST]={0};
+  void HistAdd(uint64_t bytes, double us){ int b=0; while((bytes>>b)>1) b++; histN[b]++; histBytes[b]+=bytes; histUs[b]+=us; }
+  void ResetTelemetry(void){ tAlloc=tPack=tRingA=tRingB=tGemm=0; bytesRing=nRingMsg=nMultiply=nGemm=0; for(int b=0;b<NHIST;b++){histN[b]=histBytes[b]=0; histUs[b]=0;} }
 
   static int Overlap(int64_t a0,int64_t a1,int64_t b0,int64_t b1)
   { return (a0 < b1) && (b0 < a1); }
 
-  void Multiply(ComplexD alpha,
+  void Multiply(DenseInverseScalar alpha,
                 BlockCyclicMatrix &A,
                 BlockCyclicMatrix &B,
-                ComplexD beta,
+                DenseInverseScalar beta,
                 BlockCyclicMatrix &C,
                 int64_t i0, int64_t i1,
                 int64_t j0, int64_t j1,
@@ -219,14 +215,13 @@ public:
     const uint64_t slotB1 = (uint64_t)nb*nloc_j;         // one panel
     const uint64_t slotB  = (uint64_t)S*slotB1;
     nMultiply++;
-    if ( handshake < 0 ) handshake = getenv("SUMMA_HANDSHAKE") ? atoi(getenv("SUMMA_HANDSHAKE")) : 0;
     tAlloc -= usecond();
     if ( Abuf.size() < std::max<uint64_t>(slotA*Pc,1) ) Abuf.resize( std::max<uint64_t>(slotA*Pc,1) );
     if ( Bbuf.size() < std::max<uint64_t>(slotB*Pr,1) ) Bbuf.resize( std::max<uint64_t>(slotB*Pr,1) );
     tAlloc += usecond();
 
-    deviceVector<ComplexD *> ap(1), bp(1), cp(1);
-    std::vector<ComplexD *>  ptr(1);
+    deviceVector<DenseInverseScalar *> ap(1), bp(1), cp(1);
+    std::vector<DenseInverseScalar *>  ptr(1);
 
     int firstblock = 1;
     for(int64_t r0=kb0; r0<kb1; r0+=Pc){       // rounds of Pc k-blocks
@@ -243,8 +238,8 @@ public:
           int64_t lc0, lc1;
           L.ColRange(s*nb, std::min(N,(s+1)*nb), lc0, lc1);
           GRID_ASSERT( lc1-lc0 == nb_s );
-          ComplexD *src = A.LocalWindow(li0, lc0);
-          ComplexD *dst = &Abuf[0] + slotA*pcol;
+          DenseInverseScalar *src = A.LocalWindow(li0, lc0);
+          DenseInverseScalar *dst = &Abuf[0] + slotA*pcol;
           int64_t   ld  = A.layout.mloc;
           int64_t   m   = mloc_i;
           accelerator_for(idx, (uint64_t)(m*nb_s), 1, {
@@ -259,8 +254,8 @@ public:
           GRID_ASSERT( lr1-lr0 == nb_s );
           int64_t idxs = (s - r0 - ((prow - r0%Pr + Pr) % Pr)) / Pr; // my panel # in round
           GRID_ASSERT( idxs >= 0 ); GRID_ASSERT( idxs < S );
-          ComplexD *src = B.LocalWindow(lr0, lj0);
-          ComplexD *dst = &Bbuf[0] + slotB*prow + slotB1*idxs;
+          DenseInverseScalar *src = B.LocalWindow(lr0, lj0);
+          DenseInverseScalar *dst = &Bbuf[0] + slotB*prow + slotB1*idxs;
           int64_t   ld  = B.layout.mloc;
           int64_t   nn  = nloc_j;
           accelerator_for(idx, (uint64_t)(nb_s*nn), 1, {
@@ -286,13 +281,12 @@ public:
         for(int t=1;t<Pc;t++){
           int cs = (pcol - t + 1 + Pc*Pc) % Pc;
           int cr = (pcol - t     + Pc*Pc) % Pc;
-          double ths = 0.0, tm = usecond();
-          if ( handshake ) { grid->SendToRecvFrom((void *)&hsTx, dest, (void *)&hsRx, src, sizeof(int)); ths = usecond()-tm; tm = usecond(); }
+          double tm = usecond();
           grid->SendToRecvFrom((void *)(&Abuf[0]+slotA*cs), dest,
                                (void *)(&Abuf[0]+slotA*cr), src,
-                               slotA*sizeof(ComplexD));
-          HistAdd(slotA*sizeof(ComplexD), usecond()-tm, ths);
-          bytesRing += slotA*sizeof(ComplexD); nRingMsg++;
+                               slotA*sizeof(DenseInverseScalar));
+          HistAdd(slotA*sizeof(DenseInverseScalar), usecond()-tm);
+          bytesRing += slotA*sizeof(DenseInverseScalar); nRingMsg++;
         }
         tRingA += usecond();
       }
@@ -307,13 +301,12 @@ public:
         for(int t=1;t<Pr;t++){
           int rs = (prow - t + 1 + Pr*Pr) % Pr;
           int rr = (prow - t     + Pr*Pr) % Pr;
-          double ths = 0.0, tm = usecond();
-          if ( handshake ) { grid->SendToRecvFrom((void *)&hsTx, dest, (void *)&hsRx, src, sizeof(int)); ths = usecond()-tm; tm = usecond(); }
+          double tm = usecond();
           grid->SendToRecvFrom((void *)(&Bbuf[0]+slotB*rs), dest,
                                (void *)(&Bbuf[0]+slotB*rr), src,
-                               slotB*sizeof(ComplexD));
-          HistAdd(slotB*sizeof(ComplexD), usecond()-tm, ths);
-          bytesRing += slotB*sizeof(ComplexD); nRingMsg++;
+                               slotB*sizeof(DenseInverseScalar));
+          HistAdd(slotB*sizeof(DenseInverseScalar), usecond()-tm);
+          bytesRing += slotB*sizeof(DenseInverseScalar); nRingMsg++;
         }
         tRingB += usecond();
       }
@@ -329,15 +322,15 @@ public:
         int cA = (int)(s%Pc);
         int rB = (int)(s%Pr);
         int64_t idxs = (s - r0 - ((rB - r0%Pr + Pr) % Pr)) / Pr;
-        ComplexD beta_use = firstblock ? beta : ComplexD(1.0,0.0);
+        DenseInverseScalar beta_use = firstblock ? beta : DenseInverseScalar(1.0,0.0);
         firstblock = 0;
 
         ptr[0] = &Abuf[0] + slotA*cA;
-        acceleratorCopyToDevice(&ptr[0], &ap[0], sizeof(ComplexD *));
+        acceleratorCopyToDevice(&ptr[0], &ap[0], sizeof(DenseInverseScalar *));
         ptr[0] = &Bbuf[0] + slotB*rB + slotB1*idxs;
-        acceleratorCopyToDevice(&ptr[0], &bp[0], sizeof(ComplexD *));
+        acceleratorCopyToDevice(&ptr[0], &bp[0], sizeof(DenseInverseScalar *));
         ptr[0] = C.LocalWindow(li0, lj0);
-        acceleratorCopyToDevice(&ptr[0], &cp[0], sizeof(ComplexD *));
+        acceleratorCopyToDevice(&ptr[0], &cp[0], sizeof(DenseInverseScalar *));
 
         BLAS.gemmBatched(GridBLAS_OP_N, GridBLAS_OP_N,
                          (int)mloc_i, (int)nloc_j, (int)nb_s,

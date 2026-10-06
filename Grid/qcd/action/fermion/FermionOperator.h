@@ -45,7 +45,7 @@ public:
   INHERIT_IMPL_TYPES(Impl);
 
   FermionOperator(const ImplParams &p= ImplParams()) : Impl(p) {};
-  virtual ~FermionOperator(void) = default;
+  virtual ~FermionOperator(void) { if ( _thePlannedFFT ) delete _thePlannedFFT; }
 
   virtual FermionField &tmp(void) = 0;
 
@@ -58,6 +58,38 @@ public:
   virtual GridBase *FermionRedBlackGrid(void) =0;
   virtual GridBase *GaugeGrid(void)           =0;
   virtual GridBase *GaugeRedBlackGrid(void)   =0;
+
+  ////////////////////////////////////////////////////////////////
+  // Split-communicator copies of this operator's gauge and fermion
+  // grids, returned in a new bundle with no Matrix or Linop yet.
+  // Partitions have MPI layout mpi_split. Collective.
+  ////////////////////////////////////////////////////////////////
+  SplitOperator<FermionField> *MakeSplitGrids(const Coordinate &mpi_split)
+  {
+    GridCartesian *U = dynamic_cast<GridCartesian *>(GaugeGrid());
+    GRID_ASSERT(U != nullptr);
+    GRID_ASSERT(mpi_split.size() == Nd);
+
+    double t0 = usecond();
+
+    SplitOperator<FermionField> *split = new SplitOperator<FermionField>();
+
+    split->GaugeGrid   = new GridCartesian(U->FullDimensions(),U->_simd_layout,mpi_split,*U);
+    split->GaugeRBGrid = SpaceTimeGrid::makeFourDimRedBlackGrid(split->GaugeGrid);
+    split->Partition   = GridSplitVectorIndex(U,split->GaugeGrid);
+    split->Partitions  = U->ProcessorCount()/split->GaugeGrid->ProcessorCount();
+
+    if ( FermionGrid()->Nd() == Nd+1 ) {
+      int Ls = FermionGrid()->_fdimensions[0];
+      split->FermionGrid   = SpaceTimeGrid::makeFiveDimGrid(Ls,split->GaugeGrid);
+      split->FermionRBGrid = SpaceTimeGrid::makeFiveDimRedBlackGrid(Ls,split->GaugeGrid);
+    } else {
+      split->FermionGrid   = split->GaugeGrid;
+      split->FermionRBGrid = split->GaugeRBGrid;
+    }
+    std::cout << GridLogPerformance << "MakeSplitGrids: " << (usecond()-t0)/1.0e6 << " s" << std::endl;
+    return split;
+  }
 
   // override multiply
   virtual void  M    (const FermionField &in, FermionField &out)=0;
@@ -88,6 +120,10 @@ public:
   virtual void DhopDerivEO(GaugeField &mat,const FermionField &U,const FermionField &V,int dag)=0;
   virtual void DhopDerivOE(GaugeField &mat,const FermionField &U,const FermionField &V,int dag)=0;
 
+  // 1 if MoeDeriv/MeoDeriv return a force on a single 4D checkerboard (4D red-black),
+  // 0 if they return it on the full 4D gauge grid (a checkerboard that includes s)
+  virtual int CheckerboardedForce(void) { return 1; };
+
   virtual void  Mdiag  (const FermionField &in, FermionField &out) { Mooee(in,out);};   // Same as Mooee applied to both CB's
   virtual void  Mdir   (const FermionField &in, FermionField &out,int dir,int disp)=0;   // case by case Wilson, Clover, Cayley, ContFrac, PartFrac
   virtual void  MdirAll(const FermionField &in, std::vector<FermionField> &out)=0;   // case by case Wilson, Clover, Cayley, ContFrac, PartFrac
@@ -95,9 +131,28 @@ public:
 
   virtual void  MomentumSpacePropagator(FermionField &out,const FermionField &in,RealD _m,std::vector<double> twist) { GRID_ASSERT(0);};
 
-  virtual void  FreePropagator(const FermionField &in,FermionField &out,RealD mass,std::vector<Complex> boundary,std::vector<double> twist) 
+protected:
+  // Cached planned FFT for the ACTIVE field grid -- a general utility (FreePropagator
+  // today; smoother, smearings and other users anticipated).  Frontier FFTW plan
+  // create+destroy is ~22 ms/call (measured, Test_fft_prop PLANCOST) -- ~4x the
+  // transform itself and ~80% of an unplanned call -- so a per-call `FFT theFFT(grid)`
+  // dominates.  We cache BOTH the FFT and the grid it was built on; when called with a
+  // different grid (e.g. the 5D propagator vs the 4D physical propagator) we rebuild.
+  // Lazily built, owned, deleted in the dtor.  Raw pointer, no smart pointers.
+  PlannedFFT<typename FermionField::vector_object> *_thePlannedFFT{nullptr};
+  GridBase                                         *_thePlannedFFTGrid{nullptr};
+  PlannedFFT<typename FermionField::vector_object> & ThePlannedFFT(GridBase *grid) {
+    if ( _thePlannedFFT == nullptr || _thePlannedFFTGrid != grid ) {
+      if ( _thePlannedFFT != nullptr ) delete _thePlannedFFT;   // active grid changed: rebuild
+      _thePlannedFFT     = new PlannedFFT<typename FermionField::vector_object>((GridCartesian *)grid);
+      _thePlannedFFTGrid = grid;
+    }
+    return *_thePlannedFFT;
+  }
+public:
+  virtual void  FreePropagator(const FermionField &in,FermionField &out,RealD mass,std::vector<Complex> boundary,std::vector<double> twist)
       {
-	FFT theFFT((GridCartesian *) in.Grid());
+	PlannedFFT<typename FermionField::vector_object> &theFFT = this->ThePlannedFFT(in.Grid());
 
 	typedef typename Simd::scalar_type Scalar;
 

@@ -49,8 +49,8 @@ using namespace Grid;
 static int failures = 0;
 
 // Portable |z|: ComplexD is std::complex on CPU builds and thrust::complex
-// under HIP, where std::abs does not resolve (same trap RecursiveSchurInverse
-// documents at FrobNorm2Local).  Member real()/imag() work on both.
+// under HIP, where std::abs does not resolve.  Member real()/imag() work
+// on both.
 static double Cabs(const ComplexD &z)
 {
   double re = z.real(), im = z.imag();

@@ -23,7 +23,7 @@ Author: Peter Boyle <pboyle@bnl.gov>
 //
 //   1D rank-major rows -> block cyclic -> Invert -> back to 1D rows
 //
-// which is exactly what DENSE_SCHUR2D runs inside DenseCoarseMatrix.
+// which is exactly what the dense inverse runs inside DenseCoarseMatrix.
 // CPU build under mpirun at n = 1,2,3,4.
 //
 //   T1 : RowsToCyclic against a direct ImportGlobal of the same matrix --
@@ -31,14 +31,9 @@ Author: Peter Boyle <pboyle@bnl.gov>
 //   T2 : round trip rows -> 2D -> rows -- BITWISE, uniform AND non-uniform
 //        rowStart, layouts with ragged trailing blocks.
 //   T3 : full pipeline inverse against a host Gauss-Jordan reference.
-//   T4 : CROSS-IMPLEMENTATION: the same matrix inverted by the 1D
-//        RecursiveSchurInverse and by the 2D pipeline; results compared
-//        element-wise.  Two independent implementations, two independent
-//        decompositions, one answer.
 //////////////////////////////////////////////////////////////////////////////
 
 #include <Grid/Grid.h>
-#include <Grid/algorithms/multigrid/RecursiveSchurInverse.h>
 #include <Grid/algorithms/multigrid/BlockCyclicSchurInverse.h>
 #include <Grid/algorithms/multigrid/BlockCyclicRedistribute.h>
 
@@ -47,8 +42,8 @@ using namespace Grid;
 static int failures = 0;
 
 // Portable |z|: ComplexD is std::complex on CPU builds and thrust::complex
-// under HIP, where std::abs does not resolve (same trap RecursiveSchurInverse
-// documents at FrobNorm2Local).  Member real()/imag() work on both.
+// under HIP, where std::abs does not resolve.  Member real()/imag() work
+// on both.
 static double Cabs(const ComplexD &z)
 {
   double re = z.real(), im = z.imag();
@@ -190,12 +185,11 @@ int main(int argc, char **argv)
   }
 
   ////////////////////////////////////////////////////////////////////////
-  // T3 + T4 : the DENSE_SCHUR2D pipeline against the host reference and
-  // against the INDEPENDENT 1D RecursiveSchurInverse.
+  // T3 : the 2D pipeline against the host reference.
   ////////////////////////////////////////////////////////////////////////
   {
-    bool ok3 = true, ok4 = true;
-    double worst3 = 0.0, worst4 = 0.0;
+    bool ok3 = true;
+    double worst3 = 0.0;
     BlockCyclicSchurInverse RSI2;
     for(auto &g : grids){
       for(auto &c : cfgs){
@@ -232,27 +226,9 @@ int main(int argc, char **argv)
             worst3 = std::max(worst3,d);
             if ( d > 1.0e-9 ) ok3 = false;
           }
-
-        // ---- 1D RecursiveSchurInverse on the same matrix ----
-        {
-          BlockRows Ar;  Ar.Resize(myrows, N);
-          acceleratorCopyToDevice(&h[0], &Ar.data[0], h.size()*sizeof(ComplexD));
-          std::vector<int64_t> rs = rowStart;
-          RecursiveSchurInverse RSI1(grid, N, rs, 1<<20);
-          RSI1.Invert(Ar);
-          std::vector<ComplexD> h1d(h.size());
-          acceleratorCopyFromDevice(&Ar.data[0], &h1d[0], h1d.size()*sizeof(ComplexD));
-          for(int64_t j=0;j<N;j++)
-            for(int64_t i=0;i<myrows;i++){
-              double d = Cabs(h2d[i+j*myrows]-h1d[i+j*myrows])/mxref;
-              worst4 = std::max(worst4,d);
-              if ( d > 1.0e-9 ) ok4 = false;
-            }
-        }
       }
     }
     Report("T3  2D pipeline vs host reference", ok3, "worst "+std::to_string(worst3));
-    Report("T4  2D pipeline vs 1D RecursiveSchurInverse", ok4, "worst "+std::to_string(worst4));
   }
 
   {

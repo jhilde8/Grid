@@ -20,7 +20,7 @@ Author: Peter Boyle <pboyle@bnl.gov>
 
 //////////////////////////////////////////////////////////////////////////////
 // SCALE rehearsal for the 2D distributed dense inverse: the full
-// DENSE_SCHUR2D pipeline -- 1D rows -> redistribute -> invert ->
+// 2D block-cyclic pipeline -- 1D rows -> redistribute -> invert ->
 // redistribute back -> certificate -- on a SYNTHETIC matrix of any size,
 // with no multigrid machinery, no configuration and no subspace file.
 //
@@ -31,8 +31,8 @@ Author: Peter Boyle <pboyle@bnl.gov>
 // rank; at N=138240 on 288 ranks it is the production problem shape
 // exactly, in a driver that runs in minutes.
 //
-//   S2D_N   : global dimension          (default 720, laptop friendly)
-//   S2D_NB  : block size                (default N/P rows-per-rank if that
+//   --schur2d-global-dimension <n> : N  (default 720, laptop friendly)
+//   --schur2d-block-size <n>       : nb (default N/P rows-per-rank if that
 //                                        is exact, else 48)
 //
 // The matrix is diagonally dominant (the recursion does not pivot); its
@@ -55,8 +55,8 @@ Author: Peter Boyle <pboyle@bnl.gov>
 using namespace Grid;
 
 // Portable |z|: ComplexD is std::complex on CPU builds and thrust::complex
-// under HIP, where std::abs does not resolve (same trap RecursiveSchurInverse
-// documents at FrobNorm2Local).  Member real()/imag() work on both.
+// under HIP, where std::abs does not resolve.  Member real()/imag() work
+// on both.
 static double Cabs(const ComplexD &z)
 {
   double re = z.real(), im = z.imag();
@@ -76,20 +76,6 @@ static ComplexD Fill(int64_t i, int64_t j, int64_t N)
 
 int main(int argc, char **argv)
 {
-  // Environment walk (2026-08-27): the SAME inverse runs 20.8 s in the SLATE
-  // harness and 26.5 s in the example, with the local GPU work (GEMM, leaf
-  // inverse) 25-40% slower in the example.  Knobs to reproduce the example's
-  // environment here, one at a time (systems/Frontier/schur2d_env.job):
-  //   GRID_MPI_THREAD_MULTIPLE=1  MPI_Init_thread(MULTIPLE) before Grid_init (SLATE harness does this)
-  //   S2D_BALLAST_GB=x            x GB of Lattice fields made device-resident before the invert
-  //                               (the example carries ~10.6 GB of fine-grid state in the MemoryManager)
-  //   OMP_NUM_THREADS             set in the job, read by nothing here but the runtime
-  if ( getenv("GRID_MPI_THREAD_MULTIPLE") ) {
-    int provided = 0;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-    std::cout << "GRID_MPI_THREAD_MULTIPLE: requested MPI_THREAD_MULTIPLE, provided " << provided
-              << (provided==MPI_THREAD_MULTIPLE ? " (MULTIPLE)" : " (NOT multiple)") << std::endl;
-  }
   Grid_init(&argc, &argv);
 
   GridCartesian *grid = SpaceTimeGrid::makeFourDimGrid(GridDefaultLatt(),
@@ -98,9 +84,12 @@ int main(int argc, char **argv)
   const int P  = grid->ProcessorCount();
   const int me = grid->ThisRank();
 
-  int64_t N  = getenv("S2D_N")  ? atol(getenv("S2D_N"))  : 720;
+  int64_t N = 720;
+  if ( GridCmdOptionExists(argv,argv+argc,"--schur2d-global-dimension") )
+    N = atol(GridCmdOptionPayload(argv,argv+argc,"--schur2d-global-dimension").c_str());
   int64_t nb;
-  if      ( getenv("S2D_NB") ) nb = atol(getenv("S2D_NB"));
+  if      ( GridCmdOptionExists(argv,argv+argc,"--schur2d-block-size") )
+    nb = atol(GridCmdOptionPayload(argv,argv+argc,"--schur2d-block-size").c_str());
   else if ( N % P == 0 )       nb = N/P;
   else                         nb = 48;
   GRID_ASSERT( N >= 1 ); GRID_ASSERT( nb >= 1 );
@@ -132,55 +121,12 @@ int main(int argc, char **argv)
   double t1 = usecond();
 
   ////////////////////////////////////////////////////////////////////////
-  // The DENSE_SCHUR2D pipeline, phase-timed.  A0 keeps the original for
+  // The 2D pipeline, phase-timed.  A0 keeps the original for
   // the certificate.
   ////////////////////////////////////////////////////////////////////////
   BlockCyclicMatrix A (grid,N,nb,Pr,Pc);
   BlockCyclicMatrix A0(grid,N,nb,Pr,Pc);
   BlockCyclicSchurInverse RSI2;
-
-  // Pre-heat: drive the GCD with back-to-back zgemm for S2D_PREHEAT_S seconds
-  // before the invert.  The example calls the inverse after ~100 s of full
-  // load on all 288 GCDs and its LOCAL kernels run 20-40% slower than the
-  // idle-start harness (GEMM 3.1 vs 2.5 s, leaf 0.76 vs 0.24 s) with the
-  // wires unchanged; thread level / OMP / residency (E1-E5) did not reproduce
-  // that.  If sustained load does, it is clock/power management, not code.
-  if ( getenv("S2D_PREHEAT_S") ) {
-    double secs = atof(getenv("S2D_PREHEAT_S"));
-    const int64_t W = 4320;
-    deviceVector<ComplexD> M((uint64_t)W*W), C((uint64_t)W*W);
-    { ComplexD *m = &M[0]; accelerator_for(idx,(uint64_t)W*W,1,{ m[idx] = ComplexD(1.0e-3*(idx%97),1.0e-3*(idx%89)); }); accelerator_barrier(); }
-    deviceVector<ComplexD*> ap(1),bp(1),cp(1); std::vector<ComplexD*> ptr(1);
-    ptr[0]=&M[0]; acceleratorCopyToDevice(&ptr[0],&ap[0],sizeof(ComplexD*)); acceleratorCopyToDevice(&ptr[0],&bp[0],sizeof(ComplexD*));
-    ptr[0]=&C[0]; acceleratorCopyToDevice(&ptr[0],&cp[0],sizeof(ComplexD*));
-    double t0=usecond(); int n=0; double tlast=0;
-    while ( (usecond()-t0)/1.0e6 < secs ) {
-      double t1=usecond();
-      RSI2.SUMMA.BLAS.gemmBatched(GridBLAS_OP_N,GridBLAS_OP_N,(int)W,(int)W,(int)W,ComplexD(1.0,0.0),ap,(int)W,bp,(int)W,ComplexD(0.0,0.0),cp,(int)W);
-      RSI2.SUMMA.BLAS.synchronise(); tlast=usecond()-t1; n++;
-    }
-    double tfirst = 0; (void)tfirst;
-    std::cout << GridLogMessage << "Test_schur2d_scale: pre-heat " << (usecond()-t0)/1.0e6 << " s, " << n << " zgemm W=" << W
-              << ", last zgemm " << tlast/1.0e6 << " s (" << 8.0*W*W*W/tlast/1.0e6 << " TF/s; idle-start rate 23.7)" << std::endl;
-  }
-
-  // Device ballast: Lattice fields written on the accelerator so they sit in
-  // the MemoryManager's device LRU exactly as the example's fine-grid state does.
-  typedef Lattice<iVector<iVector<vComplexD,Nc>,Ns> > BallastField;
-  std::vector<BallastField> ballast;
-  if ( getenv("S2D_BALLAST_GB") ) {
-    double gb = atof(getenv("S2D_BALLAST_GB"));
-    uint64_t fbytes = (uint64_t)grid->oSites()*sizeof(BallastField::vector_object);
-    int nf = (int)(gb*1.0e9/(double)fbytes + 0.5);
-    ballast.reserve(nf);
-    for(int i=0;i<nf;i++){
-      ballast.emplace_back(grid);
-      autoView(v, ballast[i], AcceleratorWriteDiscard);
-      accelerator_for(ss, grid->oSites(), 1, { v[ss] = Zero(); });
-    }
-    std::cout << GridLogMessage << "Test_schur2d_scale: device ballast " << nf << " fields x " << fbytes/1.0e6
-              << " MB = " << nf*fbytes/1.0e9 << " GB resident (S2D_BALLAST_GB=" << gb << ")" << std::endl;
-  }
 
   BlockCyclicRedistribute::RowsToCyclic(grid,rowStart,&rows1d[0],myrows,A);
   double t2 = usecond();

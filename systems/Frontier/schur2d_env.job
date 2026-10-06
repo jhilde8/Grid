@@ -47,6 +47,7 @@ chmod +x ./select_gpu
 root=$HOME/ParallelIO/systems/Frontier
 source $root/sourceme-rocm7.2.sh
 
+export FI_MR_CACHE_MONITOR=kdreg2       # REQUIRED for device-buffer MPI on Slingshot: libfabric memhooks monitor (default) is defective, see systems/WorkArounds.txt (libfabric #11451)
 export MPICH_GPU_SUPPORT_ENABLED=1
 export MPICH_SMP_SINGLE_COPY_MODE=CMA
 export MPICH_OFI_NIC_POLICY=GPU
@@ -76,7 +77,7 @@ run_cell () {
 
 #          name              environment
 run_cell   E1_omp1           OMP_NUM_THREADS=1
-run_cell   E2_omp1_multiple  OMP_NUM_THREADS=1 GRID_MPI_THREAD_MULTIPLE=1 MPICH_MAX_THREAD_SAFETY=multiple     # = the SLATE harness environment
+#run_cell  E2_omp1_multiple  (MPI_THREAD_MULTIPLE init: 21.2 s, NIL; the GRID_MPI_THREAD_MULTIPLE hack was removed 2026-08-28)
 run_cell   E3_omp7           OMP_NUM_THREADS=7                                                                 # the example's thread count
 run_cell   E4_omp7_ballast   OMP_NUM_THREADS=7 S2D_BALLAST_GB=10.6                                            # + the example's device residency
 run_cell   E5_omp1_ballast   OMP_NUM_THREADS=1 S2D_BALLAST_GB=10.6                                            # ballast alone

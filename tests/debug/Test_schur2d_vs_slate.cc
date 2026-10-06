@@ -64,9 +64,10 @@ Author: Peter Boyle <pboyle@bnl.gov>
 // libblaspp shadows the ROCm one via LD_LIBRARY_PATH and throws
 // "device BLAS not available" from host_malloc_pinned.
 //
-//   S2D_N, S2D_NB as in Test_schur2d_scale (default nb = N/P).
-//   S2D_SKIP_GETRI=1 skips the getri leg (host loop; ~4 min at N=138240).
-//   S2D_NOWARM=1 skips the warm-up.
+//   --schur2d-global-dimension, --schur2d-block-size as in
+//   Test_schur2d_scale (default nb = N/P).
+//   --schur2d-skip-getri skips the getri leg (host loop; ~4 min at N=138240).
+//   --schur2d-nowarm skips the warm-up.
 // A third leg, getrf+getrs(I), is SLATE's device-resident inverse route.
 //////////////////////////////////////////////////////////////////////////////
 
@@ -138,8 +139,12 @@ int main(int argc, char **argv)
   const int P  = grid->ProcessorCount();
   const int me = grid->ThisRank();
 
-  int64_t N  = getenv("S2D_N")  ? atol(getenv("S2D_N"))  : 720;
-  int64_t nb = getenv("S2D_NB") ? atol(getenv("S2D_NB")) : ( (N%P==0) ? N/P : 48 );
+  int64_t N = 720;
+  if ( GridCmdOptionExists(argv,argv+argc,"--schur2d-global-dimension") )
+    N = atol(GridCmdOptionPayload(argv,argv+argc,"--schur2d-global-dimension").c_str());
+  int64_t nb = (N%P==0) ? N/P : 48;
+  if ( GridCmdOptionExists(argv,argv+argc,"--schur2d-block-size") )
+    nb = atol(GridCmdOptionPayload(argv,argv+argc,"--schur2d-block-size").c_str());
   int Pr,Pc; BlockCyclicLayout::ChooseProcessGrid(P,Pr,Pc);
 
   std::vector<int64_t> rowStart(P+1); rowStart[0]=0;
@@ -161,10 +166,10 @@ int main(int argc, char **argv)
   // first.  Run a small throwaway inverse through BOTH paths so the timed
   // legs below measure hot code.  Not reported.
   ////////////////////////////////////////////////////////////////////////
-  // S2D_NOWARM=1 skips it (hang localisation).  Stage markers are flushed so
+  // --schur2d-nowarm skips it (hang localisation).  Stage markers are flushed so
   // a hang shows WHERE even through block-buffered stdout.
   auto Stage = [&](const char *s){ std::cout << GridLogMessage << "stage: " << s << std::endl << std::flush; };
-  if ( !getenv("S2D_NOWARM") ) {
+  if ( !GridCmdOptionExists(argv,argv+argc,"--schur2d-nowarm") ) {
     // Fixed tiny size independent of P: the purpose is handle creation and
     // kernel loading, not work.  (8*P at P=288 was N=2304 -> a 122 s SLATE
     // warm-up dominated by 288-way tile broadcasts.)  Ranks beyond the first
@@ -207,7 +212,7 @@ int main(int argc, char **argv)
 #endif
     std::cout << GridLogMessage << "warm-up done (both paths, N=" << Nw << ")" << std::endl << std::flush;
   } else {
-    std::cout << GridLogMessage << "warm-up SKIPPED (S2D_NOWARM)" << std::endl << std::flush;
+    std::cout << GridLogMessage << "warm-up SKIPPED (--schur2d-nowarm)" << std::endl << std::flush;
   }
 
   ////////////////////////////////////////////////////////////////////////
@@ -240,7 +245,7 @@ int main(int argc, char **argv)
   // LEG 2: SLATE, every layout step timed and charged.
   ////////////////////////////////////////////////////////////////////////
 #ifdef HAVE_SLATE
-  if ( !getenv("S2D_SKIP_GETRI") ) {   // S2D_SKIP_GETRI=1: getri is a host loop, minutes at N=138240
+  if ( !GridCmdOptionExists(argv,argv+argc,"--schur2d-skip-getri") ) {   // getri is a host loop, minutes at N=138240
     typedef std::complex<double> scalar_t;
     acceleratorCopyToDevice(&h[0], &rows1d[0], h.size()*sizeof(ComplexD));
     BlockCyclicMatrix A(grid,N,nb,Pr,Pc), A0(grid,N,nb,Pr,Pc);

@@ -52,6 +52,7 @@ root=$HOME/ParallelIO/systems/Frontier
 source $root/sourceme-rocm7.2.sh
 
 export OMP_NUM_THREADS=7
+export FI_MR_CACHE_MONITOR=kdreg2       # REQUIRED for device-buffer MPI on Slingshot: libfabric memhooks monitor (default) is defective, see systems/WorkArounds.txt (libfabric #11451)
 export MPICH_GPU_SUPPORT_ENABLED=1
 export MPICH_SMP_SINGLE_COPY_MODE=CMA
 export MPICH_OFI_NIC_POLICY=GPU
@@ -102,10 +103,8 @@ export PolyRecordIters=8           # outer steps recorded
 export PolyRecordStart=8           # ...starting here: the early-step polynomials are unrepresentative (M3)
 export PolyRecordSelect=last       # replay ONE recorded call's polynomial (PB: every individual call beats the coefficient mean)
 export PolyRefresh=5               # re-record every 5 outer steps: BFM BfmHDCG.C:2243, k%5==1 -> LdopM1MirsPolyRecord, single call, replayed 4 steps
-# Inverse ring-rate hypotheses, ONE AT A TIME: (1) OMP_NUM_THREADS=1 (set above);
-# (2) if (1) fails, uncomment the two lines below (harness ran 62 s with these).
-#export MPICH_MAX_THREAD_SAFETY=multiple
-#export GRID_MPI_THREAD_MULTIPLE=1
+# Inverse ring-rate hypotheses (2026-08-27): OMP threads and MPI thread level both NIL
+# (schur2d_env.job); the cause was partial ring participation -> SCHUR2D_LEAF_SPAN.
 export PolyVerbose=1               # frozen smoothers print |r_m|/|r_0| per call: separates 'bad polynomial' from 'linear V-cycle stagnates the outer'
 export FineChebLo=3.0              # harvested |R|<0.1 edge / PowerIteration edge x1.05
 export FineChebHi=137.0
@@ -122,10 +121,10 @@ run_cell () {
   export FineSmootherMode=$5; export CoarseSmootherMode=$6
   echo "----- $name : Fso=$FineSmootherOrder Fss=$FineSmootherShift Csn=$CoarseSmootherNstep fine=$FineSmootherMode coarse=$CoarseSmootherMode -----"
   fname=log.ladder.$name
-  srun -N36 -n288 --kill-on-bad-exit=1 ./select_gpu $root/examples/Example_pvdagm_v2_3level_DenseCoarseMatrix \
+  srun -N36 -n288 --kill-on-bad-exit=1 ./select_gpu $root/examples/Example_pvdagm_3level_DenseCoarseMatrix \
        --mpi ${MPI_GEOM} --grid $vol $OPTS1 --comms-overlap > $fname 2>&1
   echo "  exit $?"; sleep 60
-  echo "  $(grep -h 'V2 3-level solve Nrhs' $fname | sed 's/.*V2/V2/' | tr '\n' ' ')"
+  echo "  $(grep -h '3-level solve Nrhs' $fname | sed 's/.*3-level/3-level/' | tr '\n' ' ')"
   echo "  $(grep -h 'Fouter MrhsPGCR: Converged' $fname | sed 's/.*Converged/Converged/' | cut -c1-60 | tr '\n' ' ')"
   echo "  replay per-call |r|/|r0| (Nrhs=1 solve): $(awk '/THREE-level solve, Nrhs = 1/{s=1} s && /Fsmoother replay \|r\|/{v=$NF; n++; t+=v; if(v>mx)mx=v} END{if(n) printf "mean %.4f max %.4f over %d calls", t/n, mx, n}' $fname)"
   grep -h "SCHUR fp64 distributed invert took\|GB/s/rank\|BIG LEAVES\|ring histogram\|^Grid : Message : [0-9.]* s :    >=" $fname | sed 's/^Grid : Message : [0-9.]* s : //' | cut -c1-150 | head -12

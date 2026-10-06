@@ -37,9 +37,9 @@ Zero zero;
 // serialization strategy of Grid?
 
 // clang-format off
-struct MultiGridParams : Serializable {
+struct WilsonMGParams : Serializable {
 public:
-  GRID_SERIALIZABLE_CLASS_MEMBERS(MultiGridParams,
+  GRID_SERIALIZABLE_CLASS_MEMBERS(WilsonMGParams,
                                   int,                           nLevels,
                                   std::vector<std::vector<int>>, blockSizes,           // size == nLevels - 1
                                   std::vector<double>,           smootherTol,          // size == nLevels - 1
@@ -54,7 +54,7 @@ public:
                                   int,                           coarseSolverMaxInnerIter);
 
   // constructor with default values
-  MultiGridParams(int                           _nLevels                  = 2,
+  WilsonMGParams(int                           _nLevels                  = 2,
                   std::vector<std::vector<int>> _blockSizes               = {{4, 4, 4, 4}},
                   std::vector<double>           _smootherTol              = {1e-14},
                   std::vector<int>              _smootherMaxOuterIter     = {4},
@@ -82,7 +82,7 @@ public:
 };
 // clang-format on
 
-void checkParameterValidity(MultiGridParams const &params) {
+void checkParameterValidity(WilsonMGParams const &params) {
 
   auto correctSize = params.nLevels - 1;
 
@@ -101,7 +101,7 @@ public:
   std::vector<GridCartesian *>  Grids;
   std::vector<GridParallelRNG>  PRNGs;
 
-  LevelInfo(GridCartesian *FineGrid, MultiGridParams const &mgParams) {
+  LevelInfo(GridCartesian *FineGrid, WilsonMGParams const &mgParams) {
 
     auto nCoarseLevels = mgParams.blockSizes.size();
 
@@ -176,7 +176,7 @@ public:
   int _CurrentLevel;
   int _NextCoarserLevel;
 
-  MultiGridParams &_MultiGridParams;
+  WilsonMGParams &_WilsonMGParams;
   LevelInfo &      _LevelInfo;
 
   FineDiracMatrix & _FineMatrix;
@@ -201,10 +201,10 @@ public:
   // Member Functions
   /////////////////////////////////////////////
 
-  MultiGridPreconditioner(MultiGridParams &mgParams, LevelInfo &LvlInfo, FineDiracMatrix &FineMat, FineDiracMatrix &SmootherMat)
+  MultiGridPreconditioner(WilsonMGParams &mgParams, LevelInfo &LvlInfo, FineDiracMatrix &FineMat, FineDiracMatrix &SmootherMat)
     : _CurrentLevel(mgParams.nLevels - (nCoarserLevels + 1)) // _Level = 0 corresponds to finest
     , _NextCoarserLevel(_CurrentLevel + 1)                   // incremented for instances on coarser levels
-    , _MultiGridParams(mgParams)
+    , _WilsonMGParams(mgParams)
     , _LevelInfo(LvlInfo)
     , _FineMatrix(FineMat)
     , _SmootherMatrix(SmootherMat)
@@ -212,7 +212,7 @@ public:
     , _CoarseMatrix(*_LevelInfo.Grids[_NextCoarserLevel]) {
 
     _NextPreconditionerLevel
-      = std::unique_ptr<NextPreconditionerLevel>(new NextPreconditionerLevel(_MultiGridParams, _LevelInfo, _CoarseMatrix, _CoarseMatrix));
+      = std::unique_ptr<NextPreconditionerLevel>(new NextPreconditionerLevel(_WilsonMGParams, _LevelInfo, _CoarseMatrix, _CoarseMatrix));
 
     resetTimers();
   }
@@ -261,7 +261,7 @@ public:
     conformable(in, out);
 
     // TODO: implement a W-cycle
-    if(_MultiGridParams.kCycle)
+    if(_WilsonMGParams.kCycle)
       kCycle(in, out);
     else
       vCycle(in, out);
@@ -279,13 +279,13 @@ public:
 
     FineVector fineTmp(in.Grid());
 
-    auto maxSmootherIter = _MultiGridParams.smootherMaxOuterIter[_CurrentLevel] * _MultiGridParams.smootherMaxInnerIter[_CurrentLevel];
+    auto maxSmootherIter = _WilsonMGParams.smootherMaxOuterIter[_CurrentLevel] * _WilsonMGParams.smootherMaxInnerIter[_CurrentLevel];
 
     TrivialPrecon<FineVector>                      fineTrivialPreconditioner;
-    FlexibleGeneralisedMinimalResidual<FineVector> fineFGMRES(_MultiGridParams.smootherTol[_CurrentLevel],
+    FlexibleGeneralisedMinimalResidual<FineVector> fineFGMRES(_WilsonMGParams.smootherTol[_CurrentLevel],
                                                               maxSmootherIter,
                                                               fineTrivialPreconditioner,
-                                                              _MultiGridParams.smootherMaxInnerIter[_CurrentLevel],
+                                                              _WilsonMGParams.smootherMaxInnerIter[_CurrentLevel],
                                                               false);
 
     MdagMLinearOperator<FineDiracMatrix, FineVector> fineMdagMOp(_FineMatrix);
@@ -336,19 +336,19 @@ public:
 
     FineVector fineTmp(in.Grid());
 
-    auto smootherMaxIter = _MultiGridParams.smootherMaxOuterIter[_CurrentLevel] * _MultiGridParams.smootherMaxInnerIter[_CurrentLevel];
-    auto kCycleMaxIter   = _MultiGridParams.kCycleMaxOuterIter[_CurrentLevel] * _MultiGridParams.kCycleMaxInnerIter[_CurrentLevel];
+    auto smootherMaxIter = _WilsonMGParams.smootherMaxOuterIter[_CurrentLevel] * _WilsonMGParams.smootherMaxInnerIter[_CurrentLevel];
+    auto kCycleMaxIter   = _WilsonMGParams.kCycleMaxOuterIter[_CurrentLevel] * _WilsonMGParams.kCycleMaxInnerIter[_CurrentLevel];
 
     TrivialPrecon<FineVector>                        fineTrivialPreconditioner;
-    FlexibleGeneralisedMinimalResidual<FineVector>   fineFGMRES(_MultiGridParams.smootherTol[_CurrentLevel],
+    FlexibleGeneralisedMinimalResidual<FineVector>   fineFGMRES(_WilsonMGParams.smootherTol[_CurrentLevel],
                                                               smootherMaxIter,
                                                               fineTrivialPreconditioner,
-                                                              _MultiGridParams.smootherMaxInnerIter[_CurrentLevel],
+                                                              _WilsonMGParams.smootherMaxInnerIter[_CurrentLevel],
                                                               false);
-    FlexibleGeneralisedMinimalResidual<CoarseVector> coarseFGMRES(_MultiGridParams.kCycleTol[_CurrentLevel],
+    FlexibleGeneralisedMinimalResidual<CoarseVector> coarseFGMRES(_WilsonMGParams.kCycleTol[_CurrentLevel],
                                                                   kCycleMaxIter,
                                                                   *_NextPreconditionerLevel,
-                                                                  _MultiGridParams.kCycleMaxInnerIter[_CurrentLevel],
+                                                                  _WilsonMGParams.kCycleMaxInnerIter[_CurrentLevel],
                                                                   false);
 
     MdagMLinearOperator<FineDiracMatrix, FineVector>     fineMdagMOp(_FineMatrix);
@@ -397,7 +397,7 @@ public:
     MdagMLinearOperator<CoarseDiracMatrix, CoarseVector> coarseMdagMOp(_CoarseMatrix);
 
     std::cout << GridLogMG << " Level " << _CurrentLevel << ": **************************************************" << std::endl;
-    std::cout << GridLogMG << " Level " << _CurrentLevel << ": MG correctness check: 0 == (M - (Mdiag + Σ_μ Mdir_μ)) * v" << std::endl;
+    std::cout << GridLogMG << " Level " << _CurrentLevel << ": MG correctness check: 0 == (M - (Mdiag + Sum_mu Mdir_mu)) * v" << std::endl;
     std::cout << GridLogMG << " Level " << _CurrentLevel << ": **************************************************" << std::endl;
 
     random(_LevelInfo.PRNGs[_CurrentLevel], fineTmps[0]);
@@ -406,22 +406,22 @@ public:
     fineMdagMOp.OpDiag(fineTmps[0], fineTmps[2]); // Mdiag * v
 
     fineTmps[4] = zero;
-    for(int dir = 0; dir < 4; dir++) { //       Σ_μ Mdir_μ * v
+    for(int dir = 0; dir < 4; dir++) { //       Sum_mu Mdir_mu * v
       for(auto disp : {+1, -1}) {
         fineMdagMOp.OpDir(fineTmps[0], fineTmps[3], dir, disp);
         fineTmps[4] = fineTmps[4] + fineTmps[3];
       }
     }
 
-    fineTmps[5] = fineTmps[2] + fineTmps[4]; // (Mdiag + Σ_μ Mdir_μ) * v
+    fineTmps[5] = fineTmps[2] + fineTmps[4]; // (Mdiag + Sum_mu Mdir_mu) * v
 
     fineTmps[6]    = fineTmps[1] - fineTmps[5];
     auto deviation = std::sqrt(norm2(fineTmps[6]) / norm2(fineTmps[1]));
 
     std::cout << GridLogMG << " Level " << _CurrentLevel << ": norm2(M * v)                    = " << norm2(fineTmps[1]) << std::endl;
     std::cout << GridLogMG << " Level " << _CurrentLevel << ": norm2(Mdiag * v)                = " << norm2(fineTmps[2]) << std::endl;
-    std::cout << GridLogMG << " Level " << _CurrentLevel << ": norm2(Σ_μ Mdir_μ * v)           = " << norm2(fineTmps[4]) << std::endl;
-    std::cout << GridLogMG << " Level " << _CurrentLevel << ": norm2((Mdiag + Σ_μ Mdir_μ) * v) = " << norm2(fineTmps[5]) << std::endl;
+    std::cout << GridLogMG << " Level " << _CurrentLevel << ": norm2(Sum_mu Mdir_mu * v)           = " << norm2(fineTmps[4]) << std::endl;
+    std::cout << GridLogMG << " Level " << _CurrentLevel << ": norm2((Mdiag + Sum_mu Mdir_mu) * v) = " << norm2(fineTmps[5]) << std::endl;
     std::cout << GridLogMG << " Level " << _CurrentLevel << ": relative deviation              = " << deviation;
 
     if(deviation > tolerance) {
@@ -581,7 +581,7 @@ public:
 
   int _CurrentLevel;
 
-  MultiGridParams &_MultiGridParams;
+  WilsonMGParams &_WilsonMGParams;
   LevelInfo &      _LevelInfo;
 
   FineDiracMatrix &_FineMatrix;
@@ -594,9 +594,9 @@ public:
   // Member Functions
   /////////////////////////////////////////////
 
-  MultiGridPreconditioner(MultiGridParams &mgParams, LevelInfo &LvlInfo, FineDiracMatrix &FineMat, FineDiracMatrix &SmootherMat)
+  MultiGridPreconditioner(WilsonMGParams &mgParams, LevelInfo &LvlInfo, FineDiracMatrix &FineMat, FineDiracMatrix &SmootherMat)
     : _CurrentLevel(mgParams.nLevels - (0 + 1))
-    , _MultiGridParams(mgParams)
+    , _WilsonMGParams(mgParams)
     , _LevelInfo(LvlInfo)
     , _FineMatrix(FineMat)
     , _SmootherMatrix(SmootherMat) {
@@ -613,12 +613,12 @@ public:
     conformable(_LevelInfo.Grids[_CurrentLevel], in.Grid());
     conformable(in, out);
 
-    auto coarseSolverMaxIter = _MultiGridParams.coarseSolverMaxOuterIter * _MultiGridParams.coarseSolverMaxInnerIter;
+    auto coarseSolverMaxIter = _WilsonMGParams.coarseSolverMaxOuterIter * _WilsonMGParams.coarseSolverMaxInnerIter;
 
     // On the coarsest level we only have what I above call the fine level, no coarse one
     TrivialPrecon<FineVector>                      fineTrivialPreconditioner;
     FlexibleGeneralisedMinimalResidual<FineVector> fineFGMRES(
-      _MultiGridParams.coarseSolverTol, coarseSolverMaxIter, fineTrivialPreconditioner, _MultiGridParams.coarseSolverMaxInnerIter, false);
+      _WilsonMGParams.coarseSolverTol, coarseSolverMaxIter, fineTrivialPreconditioner, _WilsonMGParams.coarseSolverMaxInnerIter, false);
 
     MdagMLinearOperator<FineDiracMatrix, FineVector> fineMdagMOp(_FineMatrix);
 
@@ -651,7 +651,7 @@ using NLevelMGPreconditioner = MultiGridPreconditioner<Fobj, CComplex, nBasis, n
 
 template<class Fobj, class CComplex, int nBasis, class Matrix>
 std::unique_ptr<MultiGridPreconditionerBase<Lattice<Fobj>>>
-createMGInstance(MultiGridParams &mgParams, LevelInfo &levelInfo, Matrix &FineMat, Matrix &SmootherMat) {
+createMGInstance(WilsonMGParams &mgParams, LevelInfo &levelInfo, Matrix &FineMat, Matrix &SmootherMat) {
 
 #define CASE_FOR_N_LEVELS(nLevels)                                                                                     \
   case nLevels:                                                                                                        \
@@ -664,7 +664,7 @@ createMGInstance(MultiGridParams &mgParams, LevelInfo &levelInfo, Matrix &FineMa
     CASE_FOR_N_LEVELS(3);
     CASE_FOR_N_LEVELS(4);
     default:
-      std::cout << GridLogError << "We currently only support nLevels ∈ {2, 3, 4}" << std::endl;
+      std::cout << GridLogError << "We currently only support nLevels in {2, 3, 4}" << std::endl;
       exit(EXIT_FAILURE);
       break;
   }

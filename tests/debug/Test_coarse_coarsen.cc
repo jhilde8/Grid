@@ -2,7 +2,7 @@
 
     Grid physics library, www.github.com/paboyle/Grid
 
-    Source file: ./tests/debug/Test_coarse_v2_coarsen.cc
+    Source file: ./tests/debug/Test_coarse_coarsen.cc
 
     Copyright (C) 2026
 
@@ -29,11 +29,13 @@ Author: Peter Boyle <pboyle@bnl.gov>
 //
 // Coarsen the same fine operator two ways and compare the matrix elements.
 //
-//   V1 : existing mrhs CoarsenOperator, vectorised coarse space matched to
-//        the fine SIMD layout, single RHS fine applications
-//   V2 : D+1 CoarsenOperator, unvectorised sComplexD coarse space, the batch
-//        of phased basis vectors carried in the rhs direction and applied
-//        through MrhsPromotedOperator
+//   ref  : DeprecatedMultiGeneralCoarsenedMatrix::CoarsenOperator, vectorised
+//          coarse space matched to the fine SIMD layout, single RHS fine
+//          applications
+//   test : MultiGeneralCoarsenedOperator::CoarsenOperator on the D+1 grid,
+//          unvectorised sComplexD coarse space, the batch of phased basis
+//          vectors carried in the rhs direction and applied through
+//          MrhsPromotedOperator
 //
 // BLAS_A is written by GridtoBLAS in lSite order, which does not depend on
 // the SIMD layout, so the two are directly comparable.
@@ -46,21 +48,25 @@ const int nbasis = 8;
 const int batch  = 9;
 
 typedef vSpinColourVector FineObj;
-typedef vTComplex         CComplexV;   // vectorised coarse space, V1 reference
-typedef sTComplexD        CComplexS;   // unvectorised coarse space, V2
+typedef vTComplex         CComplexV;   // vectorised coarse space, reference
+typedef sTComplexD        CComplexS;   // unvectorised coarse space, under test
 
-typedef MultiGeneralCoarsenedMatrix    <FineObj,CComplexV,nbasis> MrhsV1;
-typedef MultiGeneralCoarsenedOperatorV2<FineObj,CComplexS,nbasis> MrhsV2;
+typedef DeprecatedMultiGeneralCoarsenedMatrix    <FineObj,CComplexV,nbasis> RefOperator;
+typedef MultiGeneralCoarsenedOperator<FineObj,CComplexS,nbasis> TestOperator;
 
 template<class Op>
 void ReadMatrix(Op &O,int npoint,std::vector<std::vector<typename Op::calcMatrix> > &host)
 {
   typedef typename Op::calcMatrix calcMatrix;
   host.resize(npoint);
+  // MatrixPointOut carries one stencil point in lSite order whichever internal
+  // layout the operator uses.
+  deviceVector<calcMatrix> buf;
   for(int p=0;p<npoint;p++){
-    int64_t sites = O.BLAS_A[p].size();
+    O.MatrixPointOut(p,buf);
+    int64_t sites = buf.size();
     host[p].resize(sites);
-    acceleratorCopyFromDevice(&O.BLAS_A[p][0],&host[p][0],sites*sizeof(calcMatrix));
+    acceleratorCopyFromDevice(&buf[0],&host[p][0],sites*sizeof(calcMatrix));
   }
 }
 
@@ -83,24 +89,24 @@ int main (int argc, char ** argv)
   GridRedBlackCartesian *FrbGrid    = SpaceTimeGrid::makeFourDimRedBlackGrid(FineGrid);
 
   ////////////////////////////////////////////////
-  // V1 coarse space: SIMD layout matched to the fine
+  // Reference coarse space: SIMD layout matched to the fine
   ////////////////////////////////////////////////
   Coordinate cvsimd = GridDefaultSimd(Nd,CComplexV::Nsimd());
   GridCartesian *CoarseV = new GridCartesian(clatt,cvsimd,fmpi);
 
-  // V1 puts all of the SIMD in the rhs direction. CoarsenOperator does not
-  // use the multiRHS grid; it only sizes BLAS_A, so one lane of rhs suffices.
-  int nrhs_v1 = CComplexV::Nsimd();
-  Coordinate v1latt(1,nrhs_v1),v1simd(1,CComplexV::Nsimd()),v1mpi(1,1);
+  // The reference puts all of the SIMD in the rhs direction. CoarsenOperator
+  // does not use the multiRHS grid; it only sizes BLAS_A, so one lane of rhs suffices.
+  int nrhs_ref = CComplexV::Nsimd();
+  Coordinate reflatt(1,nrhs_ref),refsimd(1,CComplexV::Nsimd()),refmpi(1,1);
   for(int d=0;d<Nd;d++){
-    v1latt.push_back(clatt[d]);
-    v1simd.push_back(1);
-    v1mpi .push_back(fmpi[d]);
+    reflatt.push_back(clatt[d]);
+    refsimd.push_back(1);
+    refmpi .push_back(fmpi[d]);
   }
-  GridCartesian *CoarseVMulti = new GridCartesian(v1latt,v1simd,v1mpi);
+  GridCartesian *CoarseVMulti = new GridCartesian(reflatt,refsimd,refmpi);
 
   ////////////////////////////////////////////////
-  // V2 coarse space: unvectorised
+  // Coarse space under test: unvectorised
   ////////////////////////////////////////////////
   Coordinate cssimd(Nd,1);
   GridCartesian *CoarseS = new GridCartesian(clatt,cssimd,fmpi);
@@ -124,8 +130,8 @@ int main (int argc, char ** argv)
 
   std::cout << GridLogMessage << "fine "<<flatt<<"   coarse "<<clatt<<"   batch "<<batch<<std::endl;
   std::cout << GridLogMessage << "Nsimd   fine "<<FineGrid->Nsimd()
-	    << "   coarse V1 "<<CoarseV->Nsimd()
-	    << "   coarse V2 "<<CoarseS->Nsimd()<<std::endl;
+	    << "   coarse ref "<<CoarseV->Nsimd()
+	    << "   coarse test "<<CoarseS->Nsimd()<<std::endl;
 
   ////////////////////////////////////////////////
   // Fine operator
@@ -151,32 +157,32 @@ int main (int argc, char ** argv)
   NextToNearestStencilGeometry4D geomS(CoarseS);
 
   ////////////////////////////////////////////////
-  // V1 coarsening, matched layouts
+  // Reference coarsening, matched layouts
   ////////////////////////////////////////////////
-  MrhsV1 OpV1(geomV,CoarseVMulti);
-  std::cout << GridLogMessage << "V1 CoarsenOperator" << std::endl;
-  OpV1.CoarsenOperator(HermOp,Subspace,CoarseV);
+  RefOperator OpRef(geomV,CoarseVMulti);
+  std::cout << GridLogMessage << "reference CoarsenOperator" << std::endl;
+  OpRef.CoarsenOperator(HermOp,Subspace,CoarseV);
 
   ////////////////////////////////////////////////
-  // V2 coarsening, D+1 fine applications, unvectorised coarse
+  // Coarsening under test, D+1 fine applications, unvectorised coarse
   ////////////////////////////////////////////////
-  MrhsV2 OpV2(geomS,CoarseS);
-  OpV2.SetGrid(CoarseSMulti);
+  TestOperator OpTest(geomS,CoarseS);
+  OpTest.SetGrid(CoarseSMulti);
 
   MrhsPromotedOperator<LatticeFermionD> MrhsHermOp(HermOp,FineGrid,batch);
 
-  std::cout << GridLogMessage << "V2 CoarsenOperator (D+1)" << std::endl;
-  OpV2.CoarsenOperator(MrhsHermOp,FineGridMulti,subspace,CoarseS);
+  std::cout << GridLogMessage << "test CoarsenOperator (D+1)" << std::endl;
+  OpTest.CoarsenOperator(MrhsHermOp,FineGridMulti,subspace,CoarseS);
 
   ////////////////////////////////////////////////
   // Compare matrix elements
   ////////////////////////////////////////////////
-  int npoint = OpV1.geom.npoint;
-  GRID_ASSERT(npoint == OpV2.geom.npoint);
-  typedef MrhsV1::calcMatrix calcMatrix;
+  int npoint = OpRef.geom.npoint;
+  GRID_ASSERT(npoint == OpTest.geom.npoint);
+  typedef RefOperator::calcMatrix calcMatrix;
   std::vector<std::vector<calcMatrix> > A1,A2;
-  ReadMatrix(OpV1,npoint,A1);
-  ReadMatrix(OpV2,npoint,A2);
+  ReadMatrix(OpRef,npoint,A1);
+  ReadMatrix(OpTest,npoint,A2);
 
   RealD num=0.0, den=0.0;
   for(int p=0;p<npoint;p++){
@@ -190,8 +196,8 @@ int main (int argc, char ** argv)
       den += real(w1[i])*real(w1[i])+imag(w1[i])*imag(w1[i]);
     }
   }
-  std::cout << GridLogMessage << "|A_V1|^2 = " << den << std::endl;
-  std::cout << GridLogMessage << "|A_V1 - A_V2|^2 / |A_V1|^2 = " << num/den << std::endl;
+  std::cout << GridLogMessage << "|A_ref|^2 = " << den << std::endl;
+  std::cout << GridLogMessage << "|A_ref - A_test|^2 / |A_ref|^2 = " << num/den << std::endl;
   GRID_ASSERT( den > 0.0 );
   GRID_ASSERT( num/den < 1.0e-20 );
 
@@ -200,14 +206,14 @@ int main (int argc, char ** argv)
   // batch assembled on the coarse side by the mixed blockProject. Block
   // Gram-Schmidt is idempotent so the subspace may be reused in place.
   ////////////////////////////////////////////////
-  MrhsV2 OpV2s(geomS,CoarseS);
-  OpV2s.SetGrid(CoarseSMulti);
+  TestOperator OpTestSrhs(geomS,CoarseS);
+  OpTestSrhs.SetGrid(CoarseSMulti);
 
-  std::cout << GridLogMessage << "V2 CoarsenOperator (single RHS fine op)" << std::endl;
-  OpV2s.CoarsenOperator(HermOp,subspace,CoarseS,batch);
+  std::cout << GridLogMessage << "test CoarsenOperator (single RHS fine op)" << std::endl;
+  OpTestSrhs.CoarsenOperator(HermOp,subspace,CoarseS,batch);
 
   std::vector<std::vector<calcMatrix> > A3;
-  ReadMatrix(OpV2s,npoint,A3);
+  ReadMatrix(OpTestSrhs,npoint,A3);
 
   RealD nums=0.0;
   for(int p=0;p<npoint;p++){
@@ -220,7 +226,7 @@ int main (int argc, char ** argv)
       nums += real(d)*real(d)+imag(d)*imag(d);
     }
   }
-  std::cout << GridLogMessage << "|A_V1 - A_V2srhs|^2 / |A_V1|^2 = " << nums/den << std::endl;
+  std::cout << GridLogMessage << "|A_ref - A_test_srhs|^2 / |A_ref|^2 = " << nums/den << std::endl;
   GRID_ASSERT( nums/den < 1.0e-20 );
 
   ////////////////////////////////////////////////
@@ -229,15 +235,15 @@ int main (int argc, char ** argv)
   // needs no SetGrid since the matrix elements are Nrhs independent.
   ////////////////////////////////////////////////
   {
-    typedef MrhsV2::CoarseMatrix CoarseMatrixS;
+    typedef TestOperator::CoarseMatrix CoarseMatrixS;
     std::vector<CoarseMatrixS> Aget(npoint,CoarseS);
-    for(int p=0;p<npoint;p++) OpV2.GetMatrix(p,Aget);
+    for(int p=0;p<npoint;p++) OpTest.GetMatrix(p,Aget);
 
-    MrhsV2 OpV2rt(geomS,CoarseS);
-    for(int p=0;p<npoint;p++) OpV2rt.SetMatrix(p,Aget);
+    TestOperator OpTestRoundTrip(geomS,CoarseS);
+    for(int p=0;p<npoint;p++) OpTestRoundTrip.SetMatrix(p,Aget);
 
     std::vector<std::vector<calcMatrix> > A4;
-    ReadMatrix(OpV2rt,npoint,A4);
+    ReadMatrix(OpTestRoundTrip,npoint,A4);
 
     RealD numrt=0.0;
     for(int p=0;p<npoint;p++){
@@ -255,19 +261,19 @@ int main (int argc, char ** argv)
   }
 
   ////////////////////////////////////////////////
-  // and V2 applies the matrix it just built
+  // and the operator under test applies the matrix it just built
   ////////////////////////////////////////////////
-  typedef MrhsV2::CoarseVector CoarseVectorS;
+  typedef TestOperator::CoarseVector CoarseVectorS;
   GridParallelRNG cRNG(CoarseS); cRNG.SeedFixedIntegers(std::vector<int>({5,6,7,8}));
   CoarseVectorS in(CoarseSMulti);  random(cRNG,in);
   CoarseVectorS out(CoarseSMulti);
 
-  OpV2.M(in,out);
+  OpTest.M(in,out);
   std::cout << GridLogMessage << "|in|^2 = " << norm2(in)
-	    << "   |M_V2 in|^2 = " << norm2(out) << std::endl;
+	    << "   |M_test in|^2 = " << norm2(out) << std::endl;
   GRID_ASSERT( norm2(out) > 0.0 );
 
-  std::cout << GridLogMessage << "Test_coarse_v2_coarsen: ALL PASS" << std::endl;
+  std::cout << GridLogMessage << "Test_coarse_coarsen: ALL PASS" << std::endl;
 
   Grid_finalize();
 }

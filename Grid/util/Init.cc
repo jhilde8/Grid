@@ -95,6 +95,8 @@ NAMESPACE_BEGIN(Grid);
 //////////////////////////////////////////////////////
 static Coordinate Grid_default_latt;
 static Coordinate Grid_default_mpi;
+static Coordinate Grid_default_batched_solver_split;
+static bool       Grid_default_batched_solver_split_node = false;
 
 int GridThread::_threads =1;
 int GridThread::_hyperthreads=1;
@@ -108,6 +110,8 @@ char *GridHostname(void)
 }
 const Coordinate &GridDefaultLatt(void)     {return Grid_default_latt;};
 const Coordinate &GridDefaultMpi(void)      {return Grid_default_mpi;};
+const Coordinate &GridDefaultBatchedSolverSplit(void)     {return Grid_default_batched_solver_split;};
+bool              GridDefaultBatchedSolverSplitNode(void) {return Grid_default_batched_solver_split_node;};
 const Coordinate GridDefaultSimd(int dims,int nsimd)
 {
   Coordinate layout(dims);
@@ -343,7 +347,11 @@ void Grid_init(int *argc,char ***argv)
     GridCmdOptionInt(arg,forcempi);
     Stencil_force_mpi = (bool)forcempi;
   }
-  
+
+  if( GridCmdOptionExists(*argv,*argv+*argc,"--shm-barrier-force") ){
+    Stencil_force_barrier = true;
+  }
+
   if( GridCmdOptionExists(*argv,*argv+*argc,"--device-mem") ){
     int MB;
     arg= GridCmdOptionPayload(*argv,*argv+*argc,"--device-mem");
@@ -538,6 +546,7 @@ void Grid_init(int *argc,char ***argv)
     std::cout<<GridLogMessage<<"  --shm  M        : allocate M megabytes of shared memory for comms"<<std::endl;
     std::cout<<GridLogMessage<<"  --shm-mpi 0|1   : Force MPI usage under multi-rank per node "<<std::endl;
     std::cout<<GridLogMessage<<"  --shm-hugepages : use explicit huge pages in mmap call "<<std::endl;
+    std::cout<<GridLogMessage<<"  --shm-barrier-force : keep the node barrier in the halo exchange under --shm-mpi 1 (only orders shared memory PUT/GET, redundant otherwise)"<<std::endl;
     std::cout<<GridLogMessage<<"  --device-mem M  : Size of device software cache for lattice fields (MB) "<<std::endl;
     std::cout<<GridLogMessage<<std::endl;
     std::cout<<GridLogMessage<<"Verbose:"<<std::endl;
@@ -557,6 +566,7 @@ void Grid_init(int *argc,char ***argv)
     std::cout<<GridLogMessage<<"Performance:"<<std::endl;
     std::cout<<GridLogMessage<<std::endl;
     std::cout<<GridLogMessage<<"  --comms-overlap    : Overlap comms with compute "<<std::endl;    
+    std::cout<<GridLogMessage<<"  --batched-solver-split a.b.c.d|node : batched solvers run independent solves on partitions of this MPI layout (node = one per node)"<<std::endl;
     std::cout<<GridLogMessage<<std::endl;
     std::cout<<GridLogMessage<<"  --dslash-generic: Wilson kernel for generic Nc"<<std::endl;    
     std::cout<<GridLogMessage<<"  --dslash-unroll : Wilson kernel for Nc=3"<<std::endl;    
@@ -607,6 +617,16 @@ void Grid_init(int *argc,char ***argv)
   GridParseLayout(*argv,*argc,
 		  Grid_default_latt,
 		  Grid_default_mpi);
+
+  if( GridCmdOptionExists(*argv,*argv+*argc,"--batched-solver-split") ){
+    std::string arg = GridCmdOptionPayload(*argv,*argv+*argc,"--batched-solver-split");
+    if ( arg == "node" ) {
+      Grid_default_batched_solver_split_node = true;
+    } else {
+      GridCmdOptionIntVector(arg,Grid_default_batched_solver_split);
+      GRID_ASSERT(Grid_default_batched_solver_split.size() == Grid_default_mpi.size());
+    }
+  }
 
   if( GridCmdOptionExists(*argv,*argv+*argc,"--decomposition") ){
     std::cout<<GridLogMessage<<"Grid Default Decomposition patterns\n";

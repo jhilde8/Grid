@@ -45,7 +45,7 @@ public:
 	FermionField in_k(in.Grid());
 	FermionField prop_k(in.Grid());
 
-	FFT theFFT((GridCartesian *) in.Grid());
+	PlannedFFT<typename FermionField::vector_object> &theFFT = this->ThePlannedFFT(in.Grid());
 
 	//phase for boundary condition
 	ComplexField coor(in.Grid());
@@ -130,6 +130,35 @@ public:
     this->SetCoefficientsTanh(zdata,1.0,0.0);
 
     Approx::zolotarev_free(zdata);
+  }
+
+  // Exact type only: derived operators must not inherit this
+  virtual SplitOperator<FermionField> *SplitClone(const Coordinate &mpi_split)
+  {
+    if ( typeid(*this) != typeid(DomainWallFermion<Impl>) ) {
+      return nullptr;
+    }
+    if ( this->Dirichlet || Impl::LsVectorised || Impl::isGparity ) {
+      return nullptr;
+    }
+    SplitOperator<FermionField> *split = this->MakeSplitGrids(mpi_split);
+
+    // Placeholder links; the doubled field is overwritten below
+    GaugeField Uplaceholder(split->GaugeGrid);
+    Uplaceholder = Zero();
+
+    DomainWallFermion<Impl> *clone = new DomainWallFermion<Impl>(Uplaceholder,
+                                                                 *split->FermionGrid,
+                                                                 *split->FermionRBGrid,
+                                                                 *split->GaugeGrid,
+                                                                 *split->GaugeRBGrid,
+                                                                 this->mass_plus,
+                                                                 this->M5,
+                                                                 this->Params);
+    this->CloneCoefficientsInto(*clone);
+    this->SplitDoubledGaugeInto(*clone);
+    split->Matrix = clone;
+    return split;
   }
 
 };

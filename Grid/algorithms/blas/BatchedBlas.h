@@ -995,7 +995,7 @@ public:
   ///////////////////////////////////////////////////////////////////////////////////
   // Explicit-leading-dimension complex double GEMM.  Mirror of the ComplexF
   // overload above; motivating use is the fp64 distributed recursive Schur
-  // inversion (RecursiveSchurInverse), whose operands are column windows of
+  // inversion (the distributed Schur recursion), whose operands are column windows of
   // larger row-slab allocations.
   ///////////////////////////////////////////////////////////////////////////////////
   void gemmBatched(GridBLASOperation_t OpA,
@@ -1942,6 +1942,10 @@ public:
 		Cs);
     synchronise();
 
+    // Synchronise ONCE, after the whole train of calls.  A synchronise inside
+    // the loop measures launch and completion latency, which at small shapes
+    // exceeds the kernel: at M=K=60, N=1, batch 1024 it hid a factor of two
+    // between the precisions and reported them level.
     RealD t0 = usecond();
     for(int i=0;i<ncall;i++){
       gemmBatched(M,N,K,
@@ -1950,8 +1954,8 @@ public:
 		  Bs, // k x n
 		  beta, 
 		  Cs);
-      synchronise();
     }
+    synchronise();
     RealD t1 = usecond();
     RealD bytes = 1.0*sizeof(CComplex)*(M*N*2+N*K+M*K)*BATCH;
     flops = 8.0*M*N*K*BATCH*ncall;

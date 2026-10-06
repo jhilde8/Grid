@@ -24,10 +24,46 @@ Author: Peter Boyle <pboyle@bnl.gov>
 NAMESPACE_BEGIN(Grid);
 
 ///////////////////////////////////////////////////////////////////////////////
+// My rows of a distributed dense matrix in the 1D rank-major row layout:
+// rank r owns contiguous global rows [rowStart[r], rowStart[r+1]) of an
+// N x N matrix, stored rows x cols column major, ld = rows; element (i,j)
+// at data[i + j*ld].  This is the layout the stencil->dense import
+// produces and the apply slab consumes; the 2D inverse slots between them
+// through the redistribution below.
+///////////////////////////////////////////////////////////////////////////////
+class BlockRows
+{
+public:
+  deviceVector<DenseInverseScalar> data;
+  int64_t                rows;
+  int64_t                cols;
+  int64_t                ld;
+
+  BlockRows()
+  {
+    rows = 0;
+    cols = 0;
+    ld   = 0;
+  }
+  void Resize(int64_t r, int64_t c)
+  {
+    rows = r;
+    cols = c;
+    ld   = r;
+    data.resize((uint64_t)r*c);
+  }
+  DenseInverseScalar *ColumnWindow(int64_t col0)
+  {
+    GRID_ASSERT( col0 >= 0 );
+    GRID_ASSERT( col0 <= cols );
+    return &data[(uint64_t)col0*ld];
+  }
+};
+
+///////////////////////////////////////////////////////////////////////////////
 // Stage 4 of the 2D distributed dense inverse: redistribution between the
-// 1D rank-major row layout (BlockRows: rank r owns contiguous global rows
-// [rowStart[r], rowStart[r+1]) of an N x N matrix, stored rows x N column
-// major with ld = rows) and the 2D block-cyclic layout.
+// 1D rank-major row layout (BlockRows above) and the 2D block-cyclic
+// layout.
 //
 // This is what lets the EXISTING stencil->dense import, its certificate,
 // the fp32 slab conversion and the apply path all remain byte-for-byte
@@ -92,10 +128,10 @@ public:
   //   buffer(a,b) = elem(rows[a], cols[b]),  a fastest.
   /////////////////////////////////////////////////////////////////////////
   static void MoveEdge(int toBuffer,
-                       ComplexD *mat, int64_t ld,
+                       DenseInverseScalar *mat, int64_t ld,
                        const std::vector<int64_t> &roff,  // per-row offset in mat
                        const std::vector<int64_t> &coff,  // per-col offset in mat
-                       ComplexD *buf)
+                       DenseInverseScalar *buf)
   {
     int64_t nr = roff.size();
     int64_t nc = coff.size();
@@ -157,7 +193,7 @@ public:
   /////////////////////////////////////////////////////////////////////////
   static void Redistribute(int dir, GridBase *grid,
                            const std::vector<int64_t> &rowStart,
-                           ComplexD *rows1d, int64_t myrows,
+                           DenseInverseScalar *rows1d, int64_t myrows,
                            BlockCyclicMatrix &A)
   {
     BlockCyclicLayout &L = A.layout;
@@ -170,7 +206,7 @@ public:
     int64_t ld1  = myrows ? myrows : 1;
 
     std::vector<int64_t> rows, cols, roff, coff;
-    deviceVector<ComplexD> sbuf(1), rbuf(1);
+    deviceVector<DenseInverseScalar> sbuf(1), rbuf(1);
 
     ///////////////////////////////////////////////////////////////////////
     // Self edge: purely local, via a bounce buffer (shares all the code).
@@ -225,7 +261,7 @@ public:
       }
       grid->SendToRecvFrom((void *)&sbuf[0], partner,
                            (void *)&rbuf[0], partner,
-                           nmax*sizeof(ComplexD));
+                           nmax*sizeof(DenseInverseScalar));
       if ( nin ){
         if ( dir > 0 ) { Offsets2D(L, irow, icol, roff, coff);
                          MoveEdge(0, &A.data[0], L.mloc, roff, coff, &rbuf[0]); }
@@ -236,12 +272,16 @@ public:
   }
 
   static void RowsToCyclic(GridBase *grid, const std::vector<int64_t> &rowStart,
-                           ComplexD *rows1d, int64_t myrows, BlockCyclicMatrix &A)
-  { Redistribute(+1, grid, rowStart, rows1d, myrows, A); }
+                           DenseInverseScalar *rows1d, int64_t myrows, BlockCyclicMatrix &A)
+  {
+    Redistribute(+1, grid, rowStart, rows1d, myrows, A);
+  }
 
   static void CyclicToRows(GridBase *grid, const std::vector<int64_t> &rowStart,
-                           BlockCyclicMatrix &A, ComplexD *rows1d, int64_t myrows)
-  { Redistribute(-1, grid, rowStart, rows1d, myrows, A); }
+                           BlockCyclicMatrix &A, DenseInverseScalar *rows1d, int64_t myrows)
+  {
+    Redistribute(-1, grid, rowStart, rows1d, myrows, A);
+  }
 };
 
 NAMESPACE_END(Grid);

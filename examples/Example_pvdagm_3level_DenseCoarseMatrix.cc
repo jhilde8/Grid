@@ -2,7 +2,7 @@
 
     Grid physics library, www.github.com/paboyle/Grid
 
-    Source file: ./examples/Example_pvdagm_v2_3level_DenseCoarseMatrix.cc
+    Source file: ./examples/Example_pvdagm_3level_DenseCoarseMatrix.cc
 
     Copyright (C) 2026
 
@@ -27,7 +27,7 @@ Author: Peter Boyle <pboyle@bnl.gov>
 /*  END LEGAL */
 
 //
-// PVdagM three level multigrid on the V2 coarse operator.
+// PVdagM three level multigrid on MultiGeneralCoarsenedOperator.
 //
 // STAGES ONE AND TWO: grids, types, subspace, and the L1 and L2 coarsenings.
 // The dense bottom and the solves are not here yet.
@@ -37,12 +37,13 @@ Author: Peter Boyle <pboyle@bnl.gov>
 //  * The coarse space is UNVECTORISED (sComplexD). The fine space stays
 //    vectorised. MultiRHSBlockProject carries the mixed layout.
 //
-//  * One operator, not two. V1 needed GeneralCoarsenedMatrix to coarsen and
-//    MultiGeneralCoarsenedMatrix to apply, bridged by CopyMatrix. V2 does
-//    both, and single versus multiRHS is SetGrid on the same object with the
-//    matrix elements built once.
+//  * One operator, not two. The deprecated path needed
+//    DeprecatedGeneralCoarsenedMatrix to coarsen and
+//    DeprecatedMultiGeneralCoarsenedMatrix to apply, bridged by CopyMatrix.
+//    This operator does both, and single versus multiRHS is SetGrid on the
+//    same object with the matrix elements built once.
 //
-//  * Nrhs is unconstrained. V1 required nrhs % vComplex::Nsimd() == 0 because
+//  * Nrhs is unconstrained. The deprecated path required nrhs % vComplex::Nsimd() == 0 because
 //    its multiRHS grid carried the SIMD in the rhs direction.
 //
 //  * CoarsenOperator takes the subspace vectors, not an Aggregation. It block
@@ -54,13 +55,15 @@ Author: Peter Boyle <pboyle@bnl.gov>
 //    ||<psi|psi> - I||_F guard below is what catches that.
 //
 // Env: LATT LS MASS NBASIS(compile time) NRHS BLOCK BLOCK2 COARSEN_BATCH
-//      HOT_START CONFIG SUBSPACE_FILE V1_CHECK MRHS_COARSEN
+//      HOT_START CONFIG SUBSPACE_FILE DEPRECATED_CHECK MRHS_COARSEN
 //
 
 #include <Grid/Grid.h>
+#include <algorithm>              // std::sort, for the runtime-environment dump in ParseEnvironment
 #include <Grid/lattice/PaddedCell.h>
 #include <Grid/stencil/GeneralLocalStencil.h>
 #include <Grid/algorithms/iterative/PrecGeneralisedConjugateResidualNonHermitian.h>
+#include <Grid/algorithms/multigrid/MrhsMultiGrid.h>
 #include <Grid/algorithms/multigrid/DenseCoarseMatrix.h>
 
 #include <memory>
@@ -188,6 +191,60 @@ void ParseEnvironment(void)
   std::cout << GridLogMessage << "PARAM: NBASIS             " << NBASIS       << std::endl;
   std::cout << GridLogMessage << "PARAM: NRHS               " << Nrhs         << std::endl;
   std::cout << GridLogMessage << "PARAM: COARSEN_BATCH      " << CoarsenBatch << std::endl;
+  // EVERY knob this programme parsed, so a log identifies its own run (2026-08-28:
+  // four jobs in the queue differing in FineSloppyComms/NRHS/mmax and none of it
+  // printed).  Interim until the Serializable parameter struct replaces all of this.
+  auto P = [](const char *n, auto v){ std::cout << GridLogMessage << "PARAM: " << std::left << std::setw(20) << n << std::right << " " << v << std::endl; };
+  P("FineSmootherShift",FineSmootherShift);   P("FineSmootherOrder",FineSmootherOrder);   P("FineSmootherMmax",FineSmootherMmax);
+  P("FineSmootherMode",FineSmootherMode);     P("FineChebLo",FineChebLo);                 P("FineChebHi",FineChebHi);
+  P("FineSloppyComms",FineSloppyComms);
+  P("CoarseSmootherShift",CoarseSmootherShift); P("CoarseSmootherNstep",CoarseSmootherNstep); P("CoarseSmootherMmax",CoarseSmootherMmax);
+  P("CoarseSmootherMode",CoarseSmootherMode); P("CoarseChebLo",CoarseChebLo);             P("CoarseChebHi",CoarseChebHi);
+  P("CoarseSolverTol",CoarseSolverTol);       P("CoarseSolverOrder",CoarseSolverOrder);   P("CoarseSolverMmax",CoarseSolverMmax);
+  P("OuterTol",OuterTol);                     P("OuterMmax",OuterMmax);                   P("OuterNstep",OuterNstep);
+  P("PowerIterations",PowerIterations);       P("PolyRecordIters",PolyRecordIters);       P("PolyRecordStart",PolyRecordStart);
+  P("PolyRecordSelect",PolyRecordSelect);     P("PolyRefresh",PolyRefresh);               P("PolyVerbose",PolyVerbose);
+  P("SmootherCoeffLog",SmootherCoeffLog);
+  // library-side knobs, read straight from the environment as the library will
+  const char *envs[] = {"BLOCK","BLOCK2","SUBSPACE_FILE","CONFIG","HOT_START","MRHS_COARSEN","DEPRECATED_CHECK",
+                        "DENSE_CC","DENSE_SCHUR","DENSE_SCHUR2D","DENSE_DEVICE_SUM","DENSE_SPLITK","DENSE_NB",
+                        "SCHUR2D_LEAF_SPAN","SCHUR2D_LEAF_LU","SCHUR2D_PROBE","SUMMA_HANDSHAKE","DENSE_APPLY_PROFILE","SLAB_FILE",
+                        "SOLVE_SRHS"};
+  for(auto e : envs) P(e, getenv(e) ? std::string(getenv(e)) : std::string("(unset)"));
+
+  ////////////////////////////////////////////////////////////////////////////////////////
+  // The COMPLETE fabric/runtime environment, scanned from environ rather than a curated
+  // list.  2026-08-30: we could not tell from a failing log whether FI_CXI_ATS was set,
+  // because it was not in the list -- and a module or the submitting shell can set
+  // anything.  A log must describe its own run without reference to the job script.
+  ////////////////////////////////////////////////////////////////////////////////////////
+  {
+    extern char **environ;
+    const char *prefixes[] = {"FI_","OFI_","MPICH_","MPIR_","PMI_","CXI_","HSA_","HIP_","ROCR_",
+                              "ROCM_","AMD_","GPU_","NUMA_","OMP_","GOMP_","GRID_","CRAY_","LIBFABRIC"};
+    std::vector<std::string> hits;
+    for(char **e = environ; e && *e; e++){
+      std::string s(*e);
+      for(auto p : prefixes){
+        if( s.compare(0,strlen(p),p)==0 ){
+          if(s.size()>200) s = s.substr(0,197)+"...";     // paths can be enormous
+          hits.push_back(s);
+          break;
+        }
+      }
+    }
+    std::sort(hits.begin(),hits.end());
+    std::cout << GridLogMessage << "PARAM: ---- runtime environment: "<<hits.size()<<" variables set ----"<<std::endl;
+    for(auto &s : hits) std::cout << GridLogMessage << "PARAM: ENV " << s << std::endl;
+    // Variables whose ABSENCE is as informative as their value (defaults bite: an unset
+    // FI_MR_CACHE_MONITOR means libfabric's defective memhooks, see systems/WorkArounds.txt).
+    const char *notable[] = {"FI_MR_CACHE_MONITOR","FI_MR_CACHE_MAX_COUNT","FI_MR_ROCR_CACHE_MONITOR_ENABLED",
+                             "FI_CXI_ATS","FI_CXI_RDZV_THRESHOLD","FI_CXI_DISABLE_HMEM_DEV_REGISTER",
+                             "FI_HMEM_ROCR_USE_DMABUF","MPICH_GPU_SUPPORT_ENABLED","MPICH_OFI_NIC_POLICY",
+                             "MPICH_SMP_SINGLE_COPY_MODE","OMP_NUM_THREADS","GRID_ALLOC_NCACHE_LARGE"};
+    for(auto n : notable) if(!getenv(n))
+      std::cout << GridLogMessage << "PARAM: ENV " << n << " (UNSET - provider/runtime default applies)" << std::endl;
+  }
 }
 
 template <class Field>
@@ -341,232 +398,9 @@ void PowerIteration(const std::string &name, LinearOperatorBase<Field> &Op, Grid
             << std::endl;
 }
 
-//////////////////////////////////////////////////////////////////////
-// Dense L3 solve on the packed D+1 coarse-coarse field
-//////////////////////////////////////////////////////////////////////
-template<class DenseType, class CoarseCoarseField>
-class MrhsDenseCCSolve : public LinearFunction<CoarseCoarseField> {
-public:
-  DenseType &_Dense;
-  int _nrhs;
-  MrhsDenseCCSolve(DenseType &D, int nrhs) : _Dense(D), _nrhs(nrhs) {}
-  using LinearFunction<CoarseCoarseField>::operator();
-  virtual void operator()(const CoarseCoarseField &in, CoarseCoarseField &out){
-    _Dense.ApplyBatch6D(in, out, _nrhs);
-  }
-};
-
-//////////////////////////////////////////////////////////////////////
-// mrhs interfaces + single-polynomial mrhs PGCR
-//////////////////////////////////////////////////////////////////////
-template<class Field>
-class MrhsLinearFunction {
-public:
-  virtual void operator()(std::vector<Field> &in, std::vector<Field> &out) = 0;
-};
-
-template<class Field>
-class MrhsPGCRNonHermitian {
-public:
-  RealD Tolerance; Integer MaxIterations; int mmax,nstep,steps,level;
-  int ZeroGuess = 0; int FirstCycle = 0;
-  std::string name = "Level 1";
-  LinearOperatorBase<Field> &Linop;
-  MrhsLinearFunction<Field> &Preconditioner;
-  std::function<void(int)> OnStep;      // called with the outer step count after every step (smoother switching)
-  void Level(int lv){ name = "Level " + std::to_string(lv); level=lv; }
-  void Name(std::string n){ name = n; }
-  void SetZeroGuess(int z){ ZeroGuess=z; }
-  MrhsPGCRNonHermitian(RealD tol,Integer maxit,LinearOperatorBase<Field> &_Linop,MrhsLinearFunction<Field> &Prec,int _mmax,int _nstep)
-    : Tolerance(tol),MaxIterations(maxit),Linop(_Linop),Preconditioner(Prec),mmax(_mmax),nstep(_nstep){ level=1; }
-  static RealD vnorm2(std::vector<Field> &x){ RealD s=0; for(auto &f:x) s+=norm2(f); return s; }
-  static ComplexD vinnerProduct(std::vector<Field> &x,std::vector<Field> &y){ ComplexD s(0); for(int r=0;r<(int)x.size();r++) s+=innerProduct(x[r],y[r]); return s; }
-  static void vaxpy(std::vector<Field> &z,ComplexD a,std::vector<Field> &x,std::vector<Field> &y){ for(int r=0;r<(int)z.size();r++) axpy(z[r],a,x[r],y[r]); }
-  void vOp(std::vector<Field> &in,std::vector<Field> &out){ GRID_TRACE("MrhsPGCR::vOp"); for(int r=0;r<(int)in.size();r++) Linop.Op(in[r],out[r]); }
-  void operator()(std::vector<Field> &src,std::vector<Field> &psi){
-    RealD cp,ssq,rsq; int nrhs=src.size(); GridBase *grid=src[0].Grid();
-    ssq=vnorm2(src); rsq=Tolerance*Tolerance*ssq;
-    std::vector<Field> r(nrhs,grid);
-    GridStopWatch T; T.Start(); steps=0; FirstCycle=1;
-    for(int k=0;k<MaxIterations;k++){
-      cp=GCRnStep(src,psi,rsq);
-      std::cout<<GridLogMessage<<std::string(level,'\t')<<" "<<name<<" MrhsPGCR("<<mmax<<","<<nstep<<") "<<steps<<" steps cp = "<<cp<<" target "<<rsq<<std::endl;
-      if(cp<rsq){
-        T.Stop(); vOp(psi,r); for(int rr=0;rr<nrhs;rr++) axpy(r[rr],-1.0,src[rr],r[rr]);
-        RealD tr=vnorm2(r);
-        std::cout<<GridLogMessage<<std::string(level,'\t')<<" "<<name<<" MrhsPGCR: Converged on iteration "<<steps
-                 <<" computed residual "<<std::sqrt(cp/ssq)<<" true residual "<<std::sqrt(tr/ssq)<<" target "<<Tolerance<<std::endl;
-        std::cout<<GridLogMessage<<std::string(level,'\t')<<" "<<name<<" MrhsPGCR Time elapsed: Total "<<T.Elapsed()<<std::endl;
-        return;
-      }
-    }
-    std::cout<<GridLogMessage<<"MrhsPGCR: did not converge"<<std::endl;
-  }
-  RealD GCRnStep(std::vector<Field> &src,std::vector<Field> &psi,RealD rsq){
-    RealD cp; ComplexD a,b,rq; int nrhs=src.size(); GridBase *grid=src[0].Grid();
-    std::vector<Field> r(nrhs,grid),Az(nrhs,grid);   // Az: restart residual scratch only
-    std::vector< std::vector<Field> > q(mmax,std::vector<Field>(nrhs,grid));
-    std::vector< std::vector<Field> > p(mmax,std::vector<Field>(nrhs,grid));
-    std::vector<RealD> qq(mmax);
-    if (ZeroGuess && FirstCycle) { for(int rr=0;rr<nrhs;rr++){ psi[rr]=Zero(); r[rr]=src[rr]; } }
-    else                         { vOp(psi,Az); for(int rr=0;rr<nrhs;rr++) r[rr]=src[rr]-Az[rr]; }
-    FirstCycle=0;
-    // p[0]=Prec(r), q[0]=A p[0], produced directly in the history slots (no copies)
-    Preconditioner(r,p[0]); vOp(p[0],q[0]); qq[0]=vnorm2(q[0]); cp=vnorm2(r);
-    for(int k=0;k<nstep;k++){
-      steps++; int kp=k+1, peri_k=k%mmax, peri_kp=kp%mmax;
-      if ( OnStep ) OnStep(steps);
-      rq=vinnerProduct(q[peri_k],r); a=rq/qq[peri_k];
-      vaxpy(psi,a,p[peri_k],psi); vaxpy(r,-a,q[peri_k],r); cp=vnorm2(r);
-      std::cout<<GridLogMessage<<std::string(level,'\t')<<" "<<name<<" MrhsPGCR step["<<steps<<"]  resid "<<cp<<" target "<<rsq<<std::endl;
-      if((k==nstep-1)||(cp<rsq)) return cp;
-      // New direction straight into its history slot: p=Prec(r), q=A p.
-      Preconditioner(r,p[peri_kp]);
-      vOp(p[peri_kp],q[peri_kp]);
-      int northog=((kp)>(mmax-1))?(mmax-1):(kp);
-      {
-	GRID_TRACE("MrhsPGCR orthog");
-        // Classical Gram-Schmidt: all coefficients against the UN-updated new q
-        // (independent, batchable), then apply.  Complex coefficient: the
-        // operator is non-Hermitian, real(<q_j,Aq>) alone left q's non-orthogonal.
-        // Batched per rhs (one fused kernel + one reduction each), the shared
-        // coefficient summed over rhs on the host, ONE GlobalSumVector.
-        std::vector<ComplexD> bcoef(northog,ComplexD(0.0)), part;
-        for(int rr=0;rr<nrhs;rr++){
-          std::vector<const Field*> qwin(northog);
-          for(int back=0;back<northog;back++){ int peri_back=(k-back)%mmax; GRID_ASSERT((k-back)>=0); qwin[back]=&q[peri_back][rr]; }
-          rankInnerProductMulti(part,qwin,q[peri_kp][rr]);
-          for(int back=0;back<northog;back++) bcoef[back]+=part[back];
-        }
-        if(northog) grid->GlobalSumVector(&bcoef[0],northog);
-        for(int back=0;back<northog;back++){ int peri_back=(k-back)%mmax; bcoef[back]=-bcoef[back]/qq[peri_back]; }
-        for(int rr=0;rr<nrhs;rr++){
-          std::vector<const Field*> qwin(northog), pwin(northog);
-          for(int back=0;back<northog;back++){ int peri_back=(k-back)%mmax; qwin[back]=&q[peri_back][rr]; pwin[back]=&p[peri_back][rr]; }
-          axpyMulti(p[peri_kp][rr],bcoef,pwin);
-          axpyMulti(q[peri_kp][rr],bcoef,qwin);
-        }
-      }
-      qq[peri_kp]=vnorm2(q[peri_kp]);
-    }
-    GRID_ASSERT(0); return cp;
-  }
-};
-
-//////////////////////////////////////////////////////////////////////
-// L2->L3 mrhs V-cycle on the D+1 coarse field
-//////////////////////////////////////////////////////////////////////
-template<class CoarseField, class CoarseCoarseField>
-class MrhsCoarseThreeLevelPrec : public LinearFunction<CoarseField> {
-public:
-  LinearOperatorBase<CoarseField>          &_CoarseOp;
-  LinearFunction<CoarseField>              &_CoarseSmoother;
-  MultiRHSBlockProject<CoarseField>        &_Projector;
-  LinearFunction<CoarseCoarseField>        &_CoarseCoarseSolve;
-  GridBase *_Coarse5d, *_CoarseCoarse5d, *_CoarseCoarseMrhs;
-  int _nrhs;
-  MrhsCoarseThreeLevelPrec(LinearOperatorBase<CoarseField> &CoarseOp,
-                           LinearFunction<CoarseField> &CoarseSmoother,
-                           MultiRHSBlockProject<CoarseField> &Projector,
-                           LinearFunction<CoarseCoarseField> &CoarseCoarseSolve,
-                           GridBase *Coarse5d, GridBase *CoarseCoarse5d, GridBase *CoarseCoarseMrhs, int nrhs)
-    : _CoarseOp(CoarseOp), _CoarseSmoother(CoarseSmoother), _Projector(Projector),
-      _CoarseCoarseSolve(CoarseCoarseSolve),
-      _Coarse5d(Coarse5d), _CoarseCoarse5d(CoarseCoarse5d), _CoarseCoarseMrhs(CoarseCoarseMrhs), _nrhs(nrhs) {}
-  using LinearFunction<CoarseField>::operator();
-  virtual void operator()(const CoarseField &in, CoarseField &out) {
-    int nrhs=_nrhs;
-    CoarseField vec1(in.Grid());
-    CoarseField vec2(in.Grid());
-    out = in;
-    _CoarseOp.Op(out,vec1);  sub(vec1,in,vec1);
-
-    // restrict, through the mixed blockProject: D+1 coarse in, D+1 cc out
-    CoarseCoarseField CCsrc(_CoarseCoarseMrhs);
-    CoarseCoarseField CCsol(_CoarseCoarseMrhs);
-    _Projector.blockProject(vec1,CCsrc);
-
-    //    CCsol=Zero(); // Is this necessary?
-    _CoarseCoarseSolve(CCsrc,CCsol);
-
-    _Projector.blockPromote(vec1,CCsol);
-    add(out,out,vec1);
-
-    _CoarseOp.Op(out,vec1);  sub(vec1,in,vec1);
-    //    vec2=Zero(); // Zero guess
-    _CoarseSmoother(vec1,vec2);
-    add(out,out,vec2);
-  }
-};
-
-//////////////////////////////////////////////////////////////////////
-// L1->L2 mrhs V-cycle
-//////////////////////////////////////////////////////////////////////
-template<class FineField, class MrhsCoarseVector, class FineSmoother>
-class MrhsTwoLevelMG : public MrhsLinearFunction<FineField> {
-public:
-  typedef MrhsCoarseVector CoarseVector;
-  LinearOperatorBase<FineField>   &_FineOperator;
-  FineSmoother                    &_PostSmoother;
-  MultiRHSBlockProject<FineField> &_Projector;
-  LinearFunction<CoarseVector>    &_CoarseSolve;
-  GridBase *_CoarseGrid, *_CoarseGridMrhs;
-  MrhsTwoLevelMG(LinearOperatorBase<FineField> &FineOp, FineSmoother &Post,
-                 MultiRHSBlockProject<FineField> &Projector, LinearFunction<CoarseVector> &CoarseSolve,
-                 GridBase *CoarseGrid, GridBase *CoarseGridMrhs)
-    : _FineOperator(FineOp),_PostSmoother(Post),_Projector(Projector),_CoarseSolve(CoarseSolve),
-      _CoarseGrid(CoarseGrid),_CoarseGridMrhs(CoarseGridMrhs){}
-  virtual void operator()(std::vector<FineField> &in, std::vector<FineField> &out){
-    // The whole V-cycle is preconditioner: its fine residuals and the
-    // smoother run with sloppy halos; the caller (the outer Krylov) gets
-    // the exact operator back on exit.
-    GRID_TRACE("MGVcycle");
-    SetFineSloppy(FineSloppyComms);
-    int nrhs=in.size(); GridBase *fgrid=in[0].Grid();
-    std::vector<FineField> vec1(nrhs,fgrid),vec2(nrhs,fgrid);
-    for(int r=0;r<nrhs;r++) out[r]=in[r];
-    { GRID_TRACE("MGFineResidual");
-      for(int r=0;r<nrhs;r++){ _FineOperator.Op(out[r],vec1[r]); sub(vec1[r],in[r],vec1[r]); }
-    }
-    // fine vector -> D+1 coarse, via the mixed blockProject
-    CoarseVector CsrcMrhs(_CoarseGridMrhs), CsolMrhs(_CoarseGridMrhs);
-    { GRID_TRACE("MGProject");
-      _Projector.blockProject(vec1,CsrcMrhs);
-    }
-    CsolMrhs=Zero();
-    { GRID_TRACE("MGCoarseSolve");
-      _CoarseSolve(CsrcMrhs,CsolMrhs);
-    }
-    { GRID_TRACE("MGPromote");
-      _Projector.blockPromote(vec1,CsolMrhs);
-      for(int r=0;r<nrhs;r++) add(out[r],out[r],vec1[r]);
-    }
-    { GRID_TRACE("MGFineResidual2");
-      for(int r=0;r<nrhs;r++){ _FineOperator.Op(out[r],vec1[r]); sub(vec1[r],in[r],vec1[r]); }
-    }
-    { GRID_TRACE("MGPostSmooth");
-      for(int r=0;r<nrhs;r++){
-	//	vec2[r]=Zero();
-	_PostSmoother(vec1[r],vec2[r]); add(out[r],out[r],vec2[r]);
-      }
-    }
-    SetFineSloppy(0);
-  }
-};
 
 int main (int argc, char ** argv)
 {
-  // GRID_MPI_THREAD_MULTIPLE=1: initialise MPI at MPI_THREAD_MULTIPLE before
-  // Grid_init (Grid asks for SERIALIZED).  The SLATE harness does this and its
-  // copy of the 2D inverse ran at ~2x the production ring rate (62 s vs
-  // 133-141 s).  Second hypothesis behind OMP_NUM_THREADS; test one at a time.
-  // Pair with MPICH_MAX_THREAD_SAFETY=multiple.
-  if ( getenv("GRID_MPI_THREAD_MULTIPLE") ) {
-    int provided = 0;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, &provided);
-    std::cout << "GRID_MPI_THREAD_MULTIPLE: requested MPI_THREAD_MULTIPLE, provided " << provided
-              << (provided==MPI_THREAD_MULTIPLE ? " (MULTIPLE)" : " (NOT multiple)") << std::endl;
-  }
   Grid_init(&argc,&argv);
   ParseEnvironment();
 
@@ -600,7 +434,7 @@ int main (int argc, char ** argv)
   GridCartesian *Coarse5d = new GridCartesian(c5latt,c5simd,c5mpi);
 
   // 6D coarse multiRHS grid: rhs is dim 0, undistributed and unvectorised.
-  // No divisibility constraint on nrhs, unlike V1.
+  // No divisibility constraint on nrhs, unlike the deprecated operators.
   Coordinate cmlatt({nrhs,1,clatt[0],clatt[1],clatt[2],clatt[3]});
   Coordinate cmsimd({1,1,1,1,1,1});
   Coordinate cmmpi ({1,1,mpi[0],mpi[1],mpi[2],mpi[3]});
@@ -662,7 +496,7 @@ int main (int argc, char ** argv)
   // Level 1 types: unvectorised coarse scalar
   //////////////////////////////////////////////////////////////////////
   typedef sTComplexD                                                          CComplexS;
-  typedef MultiGeneralCoarsenedOperatorV2<vSpinColourVector,CComplexS,nbasis> CoarseOperator;
+  typedef MultiGeneralCoarsenedOperator<vSpinColourVector,CComplexS,nbasis> CoarseOperator;
   typedef CoarseOperator::CoarseVector                                        CoarseVector;
   typedef Aggregation<vSpinColourVector,CComplexS,nbasis>                     Subspace;
 
@@ -719,6 +553,75 @@ int main (int argc, char ** argv)
   }
   SetFineSloppy(0);
 
+  // (moved here 2026-08-28: it needs AggregatesGCR.subspace, which is freed right after
+  //  the projector imports it below -- the 60 fine vectors are 20 GB of host memory per
+  //  rank and 60 LRU-eligible device fields competing with the solver's working set)
+  //////////////////////////////////////////////////////////////////////
+  // Optional cross check of the coarse matrix elements against the
+  // deprecated path, which needs a vectorised coarse space. Block Gram-Schmidt
+  // is idempotent, so the deprecated path may re-orthonormalise the same vectors in place
+  // without a second copy of the subspace.
+  //////////////////////////////////////////////////////////////////////
+  if ( getenv("DEPRECATED_CHECK") ) {
+
+    typedef DeprecatedGeneralCoarsenedMatrix     <vSpinColourVector,vTComplex,nbasis> LittleDiracOperator;
+    typedef DeprecatedMultiGeneralCoarsenedMatrix<vSpinColourVector,vTComplex,nbasis> MrhsLittleDiracOperator;
+    typedef Aggregation                <vSpinColourVector,vTComplex,nbasis> SubspaceV;
+
+    Coordinate v5latt({1,clatt[0],clatt[1],clatt[2],clatt[3]});
+    Coordinate v5simd({1,fsimd[0],fsimd[1],fsimd[2],fsimd[3]});
+    GridCartesian *Coarse5dV = new GridCartesian(v5latt,v5simd,c5mpi);
+
+    int nrhs_dep = vComplex::Nsimd();
+    Coordinate vmlatt({nrhs_dep,1,clatt[0],clatt[1],clatt[2],clatt[3]});
+    Coordinate vmsimd({vComplex::Nsimd(),1,1,1,1,1});
+    GridCartesian *CoarseMrhsV = new GridCartesian(vmlatt,vmsimd,cmmpi);
+
+    NextToNearestStencilGeometry5D geomV(Coarse5dV);
+
+    SubspaceV AggV(Coarse5dV,FGrid,cb);
+    for(int k=0;k<nbasis;k++) AggV.subspace[k]=AggregatesGCR.subspace[k];
+
+    LittleDiracOperator LittleDiracOpPV(geomV,FGrid,Coarse5dV);
+    std::cout << GridLogMessage << "*** deprecated CoarsenOperator (cross check) ***" << std::endl;
+    SetFineSloppy(FineSloppyComms);
+    LittleDiracOpPV.CoarsenOperator(PVdagM,AggV);
+    SetFineSloppy(0);
+
+    MrhsLittleDiracOperator mrhsDep(geomV,CoarseMrhsV);
+    mrhsDep.CopyMatrix(LittleDiracOpPV);
+
+    // BLAS_A is written by GridtoBLAS in lSite order and both sides carry
+    // the same scalar_object, so the two are directly comparable.
+    typedef MrhsLittleDiracOperator::calcMatrix calcMatrix;
+    int npoint = geom.npoint;
+    RealD num=0.0, den=0.0;
+    // The operator holds ONE site-major matrix buffer; MatrixPointOut hands back
+    // stencil point p in the same lSite order as the deprecated per-point
+    // array, and sizes a2.
+    deviceVector<calcMatrix> a2;
+    for(int p=0;p<npoint;p++){
+      int64_t sites = mrhsDep.BLAS_A[p].size();
+      CoarseOpPV.MatrixPointOut(p,a2);
+      GRID_ASSERT(sites == (int64_t)a2.size());
+      std::vector<calcMatrix> h1(sites),h2(sites);
+      acceleratorCopyFromDevice(&mrhsDep.BLAS_A[p][0],&h1[0],sites*sizeof(calcMatrix));
+      acceleratorCopyFromDevice(&a2[0],              &h2[0],sites*sizeof(calcMatrix));
+      ComplexD *w1=(ComplexD *)&h1[0];
+      ComplexD *w2=(ComplexD *)&h2[0];
+      int64_t words = sites*sizeof(calcMatrix)/sizeof(ComplexD);
+      for(int64_t i=0;i<words;i++){
+        ComplexD d=w1[i]-w2[i];
+        num += real(d)*real(d)+imag(d)*imag(d);
+        den += real(w1[i])*real(w1[i])+imag(w1[i])*imag(w1[i]);
+      }
+    }
+    std::cout << GridLogMessage << "DEPRECATED_CHECK: |A_dep|^2 = " << den << std::endl;
+    std::cout << GridLogMessage << "DEPRECATED_CHECK: |A_dep - A|^2 / |A_dep|^2 = " << num/den << std::endl;
+    GRID_ASSERT( den > 0.0 );
+    GRID_ASSERT( num/den < 1.0e-18 );
+  }
+
   // Stay on the batch grid: the L2 coarsening drives this operator at the
   // batch. It is switched to the solve Nrhs once L2 is built.
 
@@ -729,6 +632,10 @@ int main (int argc, char ** argv)
   MultiRHSBlockProject<LatticeFermionD> MrhsProjector;
   MrhsProjector.Allocate(nbasis,FGrid,Coarse5d);
   MrhsProjector.ImportBasis(AggregatesGCR.subspace);   // block orthonormal basis
+  // The basis now lives in the projector's BLAS_V (device); nothing after this
+  // point reads AggregatesGCR.subspace (DEPRECATED_CHECK moved above).  Free it: 60 fine
+  // fields = 20 GB host per rank, and 60 LRU-eligible device copies.
+  AggregatesGCR.subspace.clear(); AggregatesGCR.subspace.shrink_to_fit();
 
   std::vector<CoarseVector> psi_coarse(nbasis,Coarse5d);
   MrhsProjector.blockProject(rawNull,psi_coarse);      // RAW vectors in
@@ -737,70 +644,9 @@ int main (int argc, char ** argv)
   GramGuard("psi_coarse",psi_coarse,Coarse5d);
 
   //////////////////////////////////////////////////////////////////////
-  // Optional cross check of the coarse matrix elements against the V1
-  // path, which needs a vectorised coarse space. Block Gram-Schmidt is
-  // idempotent, so V1 may re-orthonormalise the same vectors in place
-  // without a second copy of the subspace.
-  //////////////////////////////////////////////////////////////////////
-  if ( getenv("V1_CHECK") ) {
-
-    typedef GeneralCoarsenedMatrix     <vSpinColourVector,vTComplex,nbasis> LittleDiracOperator;
-    typedef MultiGeneralCoarsenedMatrix<vSpinColourVector,vTComplex,nbasis> MrhsLittleDiracOperator;
-    typedef Aggregation                <vSpinColourVector,vTComplex,nbasis> SubspaceV;
-
-    Coordinate v5latt({1,clatt[0],clatt[1],clatt[2],clatt[3]});
-    Coordinate v5simd({1,fsimd[0],fsimd[1],fsimd[2],fsimd[3]});
-    GridCartesian *Coarse5dV = new GridCartesian(v5latt,v5simd,c5mpi);
-
-    int nrhs_v1 = vComplex::Nsimd();
-    Coordinate vmlatt({nrhs_v1,1,clatt[0],clatt[1],clatt[2],clatt[3]});
-    Coordinate vmsimd({vComplex::Nsimd(),1,1,1,1,1});
-    GridCartesian *CoarseMrhsV = new GridCartesian(vmlatt,vmsimd,cmmpi);
-
-    NextToNearestStencilGeometry5D geomV(Coarse5dV);
-
-    SubspaceV AggV(Coarse5dV,FGrid,cb);
-    for(int k=0;k<nbasis;k++) AggV.subspace[k]=AggregatesGCR.subspace[k];
-
-    LittleDiracOperator LittleDiracOpPV(geomV,FGrid,Coarse5dV);
-    std::cout << GridLogMessage << "*** V1 CoarsenOperator (cross check) ***" << std::endl;
-    SetFineSloppy(FineSloppyComms);
-    LittleDiracOpPV.CoarsenOperator(PVdagM,AggV);
-    SetFineSloppy(0);
-
-    MrhsLittleDiracOperator mrhsV1(geomV,CoarseMrhsV);
-    mrhsV1.CopyMatrix(LittleDiracOpPV);
-
-    // BLAS_A is written by GridtoBLAS in lSite order and both sides carry
-    // the same scalar_object, so the two are directly comparable.
-    typedef MrhsLittleDiracOperator::calcMatrix calcMatrix;
-    int npoint = geom.npoint;
-    RealD num=0.0, den=0.0;
-    for(int p=0;p<npoint;p++){
-      int64_t sites = mrhsV1.BLAS_A[p].size();
-      GRID_ASSERT(sites == (int64_t)CoarseOpPV.BLAS_A[p].size());
-      std::vector<calcMatrix> h1(sites),h2(sites);
-      acceleratorCopyFromDevice(&mrhsV1.BLAS_A[p][0],    &h1[0],sites*sizeof(calcMatrix));
-      acceleratorCopyFromDevice(&CoarseOpPV.BLAS_A[p][0],&h2[0],sites*sizeof(calcMatrix));
-      ComplexD *w1=(ComplexD *)&h1[0];
-      ComplexD *w2=(ComplexD *)&h2[0];
-      int64_t words = sites*sizeof(calcMatrix)/sizeof(ComplexD);
-      for(int64_t i=0;i<words;i++){
-        ComplexD d=w1[i]-w2[i];
-        num += real(d)*real(d)+imag(d)*imag(d);
-        den += real(w1[i])*real(w1[i])+imag(w1[i])*imag(w1[i]);
-      }
-    }
-    std::cout << GridLogMessage << "V1_CHECK: |A_V1|^2 = " << den << std::endl;
-    std::cout << GridLogMessage << "V1_CHECK: |A_V1 - A_V2|^2 / |A_V1|^2 = " << num/den << std::endl;
-    GRID_ASSERT( den > 0.0 );
-    GRID_ASSERT( num/den < 1.0e-18 );
-  }
-
-  //////////////////////////////////////////////////////////////////////
   // STAGE TWO: L2 -> L3.
   //
-  // The fine operator here is V2 at L1, which is natively multiRHS, so the
+  // The fine operator here is the L1 operator, which is natively multiRHS, so the
   // multiRHS driver applies with no promotion adapter: its D+1 grid IS the
   // batch grid the L1 operator is currently set to.
   //////////////////////////////////////////////////////////////////////
@@ -822,7 +668,7 @@ int main (int argc, char ** argv)
   // Coarsening deepens the tensor nest by one iScalar
   typedef CoarseVector::vector_object                                         CoarseSiteObj;
   typedef iScalar<CComplexS>                                                  CComplexS2;
-  typedef MultiGeneralCoarsenedOperatorV2<CoarseSiteObj,CComplexS2,nbasis>    CoarseCoarseOperator;
+  typedef MultiGeneralCoarsenedOperator<CoarseSiteObj,CComplexS2,nbasis>    CoarseCoarseOperator;
   typedef CoarseCoarseOperator::CoarseVector                                  CoarseCoarseVector;
 
   NextToNearestStencilGeometry5D geom2(CoarseCoarse5d);
@@ -890,7 +736,7 @@ int main (int argc, char ** argv)
   // STAGE THREE (part one): the dense bottom on L2.
   //
   // DenseCoarseMatrix is bilingual: it takes the elements through
-  // Geometry()/ExtractMatrix(), so the V2 operator serves directly. It does
+  // Geometry()/ExtractMatrix(), so the L2 operator serves directly. It does
   // detect that a multiRHS op cannot apply on the D dimensional grid and
   // skips its own certificate and VERIFY, so the equivalent check is done
   // here instead, driving the L2 operator at Nrhs 1 through a slice.
@@ -900,7 +746,7 @@ int main (int argc, char ** argv)
 
   if ( getenv("DENSE_CC")==nullptr || atoi(getenv("DENSE_CC")) ) {
 
-    std::cout << GridLogMessage << "*** L3 dense bottom: import from the V2 L2 operator ***" << std::endl;
+    std::cout << GridLogMessage << "*** L3 dense bottom: import from the L2 operator ***" << std::endl;
     DenseCC.reset(new DenseCC_t(CoarseCoarse5d));
     DenseCC->Import(CoarseOpL2);
 
@@ -950,7 +796,33 @@ int main (int argc, char ** argv)
   auto RunSolve = [&](int nr)
   {
     std::cout << GridLogMessage << "**********************************************" << std::endl;
-    std::cout << GridLogMessage << " V2 THREE-level solve, Nrhs = " << nr << std::endl;
+    std::cout << GridLogMessage << " THREE-level solve, Nrhs = " << nr << std::endl;
+    // Device-memory budget BEFORE the solve (2026-08-28: NRHS=6 died in hipMalloc at the
+    // first fine-smoother history allocation -- reported as an asynchronous "memory
+    // access fault" unless AMD_SERIALIZE_KERNEL/COPY made it a clean OOM).  The outer
+    // mRHS GCR holds src, sol, r, Az and OuterMmax x (p,q) fine fields PER RHS; the fine
+    // smoother adds FineSmootherMmax x (p,q) once.  The MemoryManager LRU cap
+    // (--device-mem) must be BELOW what is physically left after the non-LRU allocations
+    // (comms buffers, dense slab, stencil buffers), or the device fills before anything
+    // is evicted.  Print the estimate, the LRU state, and the device's own free count.
+    {
+      uint64_t fieldBytes = (uint64_t)FGrid->lSites()*sizeof(typename LatticeFermionD::scalar_object);
+      double outerGB = (double)nr*(4 + 2*OuterMmax)*fieldBytes/1.0e9;
+      double smthGB  = (double)(2*FineSmootherMmax + 4)*fieldBytes/1.0e9;
+      std::cout << GridLogMessage << "Device budget: fine field " << fieldBytes/1.0e6 << " MB; outer GCR history "
+                << nr << " x (4 + 2 x " << OuterMmax << ") fields = " << outerGB << " GB; fine smoother history + temps ~ "
+                << smthGB << " GB; MemoryManager device LRU " << MemoryManager::DeviceCacheBytes()/1.0e9 << " GB now, cap "
+                << MemoryManager::DeviceMaxBytes/1.0e9 << " GB" << std::endl;
+      // Empty the device LRU: every setup-era Lattice copy (coarse null vectors,
+      // coarsening temporaries) goes back to host, so the solve's working set
+      // starts from a clean device and the cap applies to it alone.
+      MemoryManager::EvictAll();
+      // ...and release the allocation caches' held blocks (setup-era deviceVector
+      // scratch that is "free" to the caller but not to hipMalloc).
+      MemoryManager::DropCache();
+      MemoryManager::PrintBytes();
+      acceleratorMem();
+    }
     std::cout << GridLogMessage << "**********************************************" << std::endl;
 
     Coordinate cml({nr,1,clatt[0],clatt[1],clatt[2],clatt[3]});
@@ -995,6 +867,8 @@ int main (int argc, char ** argv)
     SwitchableSmoother<LatticeFermionD> FineSmootherSlot(SmootherGCR,"Fsmoother GCR");
     MrhsTwoLevelMG<LatticeFermionD,CoarseVector,SwitchableSmoother<LatticeFermionD> >
       ThreeLevelPrecon(PVdagM, FineSmootherSlot, MrhsProjector, L2PGCR, Coarse5d, CMrhs);
+    ThreeLevelPrecon.SetSloppy   = SetFineSloppy;
+    ThreeLevelPrecon.SloppyComms = FineSloppyComms;
 
     MrhsPGCRNonHermitian<LatticeFermionD>
       L1PGCR(OuterTol,1000,PVdagM,ThreeLevelPrecon,OuterMmax,OuterNstep);
@@ -1084,7 +958,7 @@ int main (int argc, char ** argv)
     GridStopWatch w; w.Start();
     L1PGCR(src,sol);
     w.Stop();
-    std::cout << GridLogMessage << "V2 3-level solve Nrhs "<<nr<<" total " << w.Elapsed()
+    std::cout << GridLogMessage << "3-level solve Nrhs "<<nr<<" total " << w.Elapsed()
               << "  (per RHS: " << w.useconds()/1.0e6/nr << " s)" << std::endl;
 
     // The outer operator is exact by policy; assert the state rather than

@@ -2,7 +2,7 @@
 
     Grid physics library, www.github.com/paboyle/Grid
 
-    Source file: ./tests/debug/Test_coarse_v2.cc
+    Source file: ./tests/debug/Test_coarse.cc
 
     Copyright (C) 2026
 
@@ -27,17 +27,18 @@ Author: Peter Boyle <pboyle@bnl.gov>
 /*  END LEGAL */
 
 //
-// MultiGeneralCoarsenedOperatorV2 against the existing mrhs coarse operator.
+// MultiGeneralCoarsenedOperator against the existing mrhs coarse operator.
 //
-// V1 is constructed on the D+1 grid as now; V2 on the D dimensional grid,
-// with SetGrid() adopting the caller owned D+1 grid and building its padded
-// cell and neighbour table from the D dimensional stencil, with the Nrhs
-// factor multiplied in.
+// The reference (the deprecated operator) is constructed on the D+1 grid; the
+// operator under test on the D dimensional grid, with SetGrid() adopting the
+// caller owned D+1 grid and building its padded cell and neighbour table from
+// the D dimensional stencil, with the Nrhs factor multiplied in.
 //
 // Both are given identical matrix elements, so any difference in the apply is
 // the restructured neighbour table. The same geometry object is passed to
-// both: V1 adds one to skip for the rhs direction, V2 uses it as is on the D
-// dimensional grid, so both describe the same stencil over the D dimensions.
+// both: the reference adds one to skip for the rhs direction, the operator
+// under test uses it as is on the D dimensional grid, so both describe the
+// same stencil over the D dimensions.
 //
 #include <Grid/Grid.h>
 
@@ -48,8 +49,8 @@ const int nbasis = 8;
 typedef vSpinColourVector FineObj;
 typedef sTComplexD        CComplexT;   // unvectorised coarse space
 
-typedef MultiGeneralCoarsenedMatrix    <FineObj,CComplexT,nbasis> MrhsV1;
-typedef MultiGeneralCoarsenedOperatorV2<FineObj,CComplexT,nbasis> MrhsV2;
+typedef DeprecatedMultiGeneralCoarsenedMatrix    <FineObj,CComplexT,nbasis> RefOperator;
+typedef MultiGeneralCoarsenedOperator<FineObj,CComplexT,nbasis> TestOperator;
 
 ////////////////////////////////////////////////////////////////////////
 // Identical random matrix elements into both operators
@@ -59,11 +60,16 @@ void SeedMatrixElements(OpA &A,OpB &B,int npoint,GridSerialRNG &sRNG)
 {
   typedef typename OpA::calcMatrix calcMatrix;
 
+  deviceVector<calcMatrix> bufA,bufB;
   for(int p=0;p<npoint;p++){
 
-    GRID_ASSERT(A.BLAS_A[p].size() == B.BLAS_A[p].size());
+    // MatrixPointOut/In carry one stencil point in lSite order whichever
+    // internal layout the operator uses.
+    A.MatrixPointOut(p,bufA);
+    B.MatrixPointOut(p,bufB);
+    GRID_ASSERT(bufA.size() == bufB.size());
 
-    int64_t sites = A.BLAS_A[p].size();
+    int64_t sites = bufA.size();
     std::vector<calcMatrix> host(sites);
 
     ComplexD *w = (ComplexD *)&host[0];
@@ -75,8 +81,9 @@ void SeedMatrixElements(OpA &A,OpB &B,int npoint,GridSerialRNG &sRNG)
       w[i] = ComplexD(re-0.5,im-0.5);
     }
 
-    acceleratorCopyToDevice(&host[0],&A.BLAS_A[p][0],sites*sizeof(calcMatrix));
-    acceleratorCopyToDevice(&host[0],&B.BLAS_A[p][0],sites*sizeof(calcMatrix));
+    acceleratorCopyToDevice(&host[0],&bufA[0],sites*sizeof(calcMatrix));
+    A.MatrixPointIn(p,bufA);
+    B.MatrixPointIn(p,bufA);
   }
 }
 
@@ -85,10 +92,12 @@ RealD MatrixChecksum(Op &O,int npoint)
 {
   typedef typename Op::calcMatrix calcMatrix;
   RealD sum=0.0;
+  deviceVector<calcMatrix> buf;
   for(int p=0;p<npoint;p++){
-    int64_t sites = O.BLAS_A[p].size();
+    O.MatrixPointOut(p,buf);
+    int64_t sites = buf.size();
     std::vector<calcMatrix> host(sites);
-    acceleratorCopyFromDevice(&O.BLAS_A[p][0],&host[0],sites*sizeof(calcMatrix));
+    acceleratorCopyFromDevice(&buf[0],&host[0],sites*sizeof(calcMatrix));
     ComplexD *w = (ComplexD *)&host[0];
     int64_t words = sites*sizeof(calcMatrix)/sizeof(ComplexD);
     for(int64_t i=0;i<words;i++) sum += real(w[i])*real(w[i]) + imag(w[i])*imag(w[i]);
@@ -107,7 +116,7 @@ int main (int argc, char ** argv)
   Coordinate cmpi  = GridDefaultMpi();
 
   ////////////////////////////////////////////////
-  // D dimensional coarse grid, and D+1 for V1
+  // D dimensional coarse grid, and D+1 for the reference
   ////////////////////////////////////////////////
   GridCartesian *CoarseD = new GridCartesian(clatt,csimd,cmpi);
 
@@ -129,35 +138,35 @@ int main (int argc, char ** argv)
   }
   GridCartesian *CoarseMulti = new GridCartesian(mlatt,msimd,mmpi);
 
-  MrhsV2 OpV2(geom,CoarseD);
-  MrhsV1 OpV1(geom,CoarseMulti);
-  OpV2.SetGrid(CoarseMulti);
+  TestOperator OpTest(geom,CoarseD);
+  RefOperator OpRef(geom,CoarseMulti);
+  OpTest.SetGrid(CoarseMulti);
 
   std::cout << GridLogMessage << "coarse D+1 grid nrhs " << nrhs
 	    << "  Nsimd " << CoarseMulti->Nsimd() << std::endl;
 
-  std::cout << GridLogMessage << "npoint V1 " << OpV1.geom.npoint
-	    << "   npoint V2 " << OpV2.geom.npoint << std::endl;
-  GRID_ASSERT(OpV1.geom.npoint == OpV2.geom.npoint);
+  std::cout << GridLogMessage << "npoint ref " << OpRef.geom.npoint
+	    << "   npoint test " << OpTest.geom.npoint << std::endl;
+  GRID_ASSERT(OpRef.geom.npoint == OpTest.geom.npoint);
 
-  int npoint = OpV1.geom.npoint;
+  int npoint = OpRef.geom.npoint;
 
   ////////////////////////////////////////////////
   // Identical matrix elements
   ////////////////////////////////////////////////
   GridSerialRNG sRNG; sRNG.SeedFixedIntegers(std::vector<int>({7,8,9,10}));
-  SeedMatrixElements(OpV1,OpV2,npoint,sRNG);
+  SeedMatrixElements(OpRef,OpTest,npoint,sRNG);
 
-  RealD ckV1 = MatrixChecksum(OpV1,npoint);
-  RealD ckV2 = MatrixChecksum(OpV2,npoint);
-  std::cout << GridLogMessage << "matrix element checksum V1 " << ckV1
-	    << "  V2 " << ckV2 << std::endl;
-  GRID_ASSERT( ckV1 == ckV2 );
+  RealD ckRef = MatrixChecksum(OpRef,npoint);
+  RealD ckTest = MatrixChecksum(OpTest,npoint);
+  std::cout << GridLogMessage << "matrix element checksum ref " << ckRef
+	    << "  test " << ckTest << std::endl;
+  GRID_ASSERT( ckRef == ckTest );
 
   ////////////////////////////////////////////////
   // Same input, compare the applies
   ////////////////////////////////////////////////
-  typedef MrhsV1::CoarseVector CoarseVector;
+  typedef RefOperator::CoarseVector CoarseVector;
   // RNG on the D dimensional grid fills any D+1 field: the rhs direction is
   // undistributed and divides cleanly. One RNG serves every Nrhs.
   GridParallelRNG pRNG(CoarseD); pRNG.SeedFixedIntegers(std::vector<int>({1,2,3,4}));
@@ -167,22 +176,22 @@ int main (int argc, char ** argv)
   CoarseVector out2(CoarseMulti);
   CoarseVector err (CoarseMulti);
 
-  OpV1.M(in,out1);
-  OpV2.M(in,out2);
+  OpRef.M(in,out1);
+  OpTest.M(in,out2);
 
   err = out1 - out2;
-  std::cout << GridLogMessage << "|V1 out|^2 = " << norm2(out1)
-	    << "   |V2 out|^2 = " << norm2(out2) << std::endl;
-  std::cout << GridLogMessage << "|V1 - V2|^2 = " << norm2(err) << std::endl;
+  std::cout << GridLogMessage << "|ref out|^2 = " << norm2(out1)
+	    << "   |test out|^2 = " << norm2(out2) << std::endl;
+  std::cout << GridLogMessage << "|ref - test|^2 = " << norm2(err) << std::endl;
   GRID_ASSERT( norm2(out1) > 0.0 );
   GRID_ASSERT( norm2(err) == 0.0 );
 
   ////////////////////////////////////////////////
   // SetGrid is idempotent on pointer identity
   ////////////////////////////////////////////////
-  OpV2.SetGrid(CoarseMulti);
-  GRID_ASSERT( MatrixChecksum(OpV2,npoint) == ckV2 );
-  OpV2.M(in,out2);
+  OpTest.SetGrid(CoarseMulti);
+  GRID_ASSERT( MatrixChecksum(OpTest,npoint) == ckTest );
+  OpTest.M(in,out2);
   err = out1 - out2;
   GRID_ASSERT( norm2(err) == 0.0 );
   std::cout << GridLogMessage << "SetGrid idempotent on identity" << std::endl;
@@ -194,7 +203,7 @@ int main (int argc, char ** argv)
   ////////////////////////////////////////////////
   // Nrhs 1 is the single RHS case through the multiRHS path, and each slice
   // of the Nrhs 4 apply must come back unchanged.
-  OpV2.M(in,out2);
+  OpTest.M(in,out2);
   for(int nr=2;nr>=1;nr--){
     Coordinate latt2(1,nr), simd2(1,1), mpi2(1,1);
     for(int d=0;d<Nd;d++){
@@ -204,9 +213,9 @@ int main (int argc, char ** argv)
     }
     GridCartesian *CoarseMulti2 = new GridCartesian(latt2,simd2,mpi2);
 
-    OpV2.SetGrid(CoarseMulti2);
-    GRID_ASSERT( OpV2.Nrhs() == nr );
-    GRID_ASSERT( MatrixChecksum(OpV2,npoint) == ckV2 );
+    OpTest.SetGrid(CoarseMulti2);
+    GRID_ASSERT( OpTest.Nrhs() == nr );
+    GRID_ASSERT( MatrixChecksum(OpTest,npoint) == ckTest );
 
     CoarseVector in2 (CoarseMulti2);
     CoarseVector out(CoarseMulti2);
@@ -215,7 +224,7 @@ int main (int argc, char ** argv)
       ExtractSliceFast(slice,in,r,0);
       InsertSliceFast(slice,in2,r,0);
     }
-    OpV2.M(in2,out);
+    OpTest.M(in2,out);
 
     RealD sdiff=0.0;
     for(int r=0;r<nr;r++){
@@ -231,22 +240,22 @@ int main (int argc, char ** argv)
     GRID_ASSERT( norm2(out) > 0.0 );
     GRID_ASSERT( sdiff/norm2(out) < 1.0e-20 );
 
-    OpV2.ReleaseGrid();
-    GRID_ASSERT( MatrixChecksum(OpV2,npoint) == ckV2 );  // survives release
+    OpTest.ReleaseGrid();
+    GRID_ASSERT( MatrixChecksum(OpTest,npoint) == ckTest );  // survives release
 
     delete CoarseMulti2;
   }
 
-  OpV2.SetGrid(CoarseMulti);
-  GRID_ASSERT( OpV2.Nrhs() == nrhs );
+  OpTest.SetGrid(CoarseMulti);
+  GRID_ASSERT( OpTest.Nrhs() == nrhs );
 
-  OpV2.M(in,out2);
+  OpTest.M(in,out2);
   err = out1 - out2;
-  std::cout << GridLogMessage << "after Nrhs 4 -> 2 -> 1 -> release -> 4, |V1 - V2|^2 = "
+  std::cout << GridLogMessage << "after Nrhs 4 -> 2 -> 1 -> release -> 4, |ref - test|^2 = "
 	    << norm2(err) << std::endl;
   GRID_ASSERT( norm2(err) == 0.0 );
 
-  std::cout << GridLogMessage << "Test_coarse_v2: ALL PASS" << std::endl;
+  std::cout << GridLogMessage << "Test_coarse: ALL PASS" << std::endl;
 
   Grid_finalize();
 }

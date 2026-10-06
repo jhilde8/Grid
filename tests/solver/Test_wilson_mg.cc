@@ -51,7 +51,7 @@ int main(int argc, char **argv) {
 
   RealD mass = -0.25;
 
-  MultiGridParams mgParams;
+  WilsonMGParams mgParams;
   std::string     inputXml{"./mg_params.xml"};
 
   if(GridCmdOptionExists(argv, argv + argc, "--inputxml")) {

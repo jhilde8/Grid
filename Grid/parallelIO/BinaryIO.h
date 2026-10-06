@@ -266,9 +266,10 @@ class BinaryIO {
   // GRID_BINARYIO_NOAGGREGATE falls back to plain lexicographic I/O.
   static int DefaultControl(void)
   {
-    static int ctrl = getenv("GRID_BINARYIO_NOAGGREGATE")
-                    ? BINARYIO_LEXICOGRAPHIC
-                    : BINARYIO_LEXICOGRAPHIC|BINARYIO_AGGREGATE;
+    //    static int ctrl = getenv("GRID_BINARYIO_NOAGGREGATE")
+    //                    ? BINARYIO_LEXICOGRAPHIC
+    //                    : BINARYIO_LEXICOGRAPHIC|BINARYIO_AGGREGATE;
+    static int ctrl = BINARYIO_LEXICOGRAPHIC|BINARYIO_AGGREGATE;
     return ctrl;
   }
 

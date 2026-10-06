@@ -29,7 +29,6 @@ Author: Peter Boyle <pboyle@bnl.gov>
 
 #include <Grid/algorithms/blas/BatchedBlas.h>
 #include <Grid/algorithms/blas/BatchedInverse.h>
-#include <Grid/algorithms/multigrid/RecursiveSchurInverse.h>
 #include <Grid/algorithms/multigrid/BlockCyclicSchurInverse.h>
 #include <Grid/algorithms/multigrid/BlockCyclicRedistribute.h>
 
@@ -39,48 +38,34 @@ NAMESPACE_BEGIN(Grid);
 
 //////////////////////////////////////////////////////////////////////////////////////
 // DenseCoarseMatrix: a coarsened operator treated as a DENSE matrix -- explicit,
-// row-distributed A^{-1} of a GeneralCoarsenedMatrix.  Library-grade successor of
-// the example-local DistributedDenseInverse (Example_pvdagm_mrhs_3level_dense.cc,
-// FROZEN as the regression baseline).
+// row-distributed A^{-1} of a coarsened operator.
 //
-// What is new versus the example class:
 //  - Stencil -> dense DIRECT IMPORT.  The coarse operator IS the dense matrix
 //    unrolled: Dense[(s,a),(s+shift_p,b)] += A[p][s]_{a,b}.  Rows of my sites are
-//    assembled from purely LOCAL _A[p] data: no operator applies, no comms -- the
-//    O(N) probe assembly (93 s at N=69120) is retired.  ACCUMULATE (+=) because on
-//    short axes distinct shifts wrap to the same neighbour.  An IMPORT CERTIFICATE
-//    compares the dense apply against Op.M on a NON-CONSTANT vector (a constant one
-//    cannot see a shift-sign error); DENSE_IMPORT_SIGN=-1 flips the convention
-//    without recompiling.
+//    assembled from purely LOCAL _A[p] data: no operator applies, no comms.
+//    ACCUMULATE (+=) because on short axes distinct shifts wrap to the same
+//    neighbour.  An IMPORT CERTIFICATE compares the dense apply against Op.M on a
+//    NON-CONSTANT vector (a constant one cannot see a shift-sign error).
+//
+//  - Inversion is END-TO-END fp64 through the 2D block-cyclic recursive Schur
+//    complement (BlockCyclicSchurInverse): fp64 rank-major import ->
+//    RowsToCyclic -> in-place recursion (pure point-to-point SUMMA rings and
+//    local leaves; bitwise reproducible) -> CyclicToRows -> ONE terminal
+//    rounding into the fp32 apply slab.  Distributed at every N and P.
+//
 //  - Split-K apply through GridBLAS.gemmBatched with EXPLICIT leading dimensions
 //    (arXiv:2409.03904 fig 11): the tiny-output/huge-K GEMM Y = slab^T X becomes
-//    DENSE_SPLITK chunk-GEMMs by pointer offset into the resident slab (lda = N),
-//    partials reduced in one accelerator_for.  Platform-agnostic: deviceVector +
-//    GridBLAS run the SAME code on HIP/CUDA/SYCL and CPU(Eigen).
-//  - deviceVector everywhere in the apply path; the ONE surviving naked-HIP block
-//    is the boss inversion buffer (quarantined below, documented).
+//    SPLITK chunk-GEMMs by pointer offset into the resident slab (lda = N),
+//    partials reduced in one accelerator_for.  The source vector is assembled by
+//    a cartesian ring ALLGATHER of device buffers (pure P2P; ~8x fewer bytes
+//    than a padded allreduce, and no collective size cliffs).  Platform-agnostic:
+//    deviceVector + GridBLAS run the SAME code on HIP/CUDA/SYCL and CPU(Eigen).
 //
-// Setup: SLAB_FILE=<stem> loads per-rank <stem>.<rank> (header-guarded N/nrows/
-// nbasis -- the interchange format shared with the frozen example; the STEM must
-// encode cfg/mass/blocking/nbasis, only the header is guarded).  Absent: direct
-// import -> import certificate -> chunked zero-fill+GlobalSum gather streamed to
-// the boss GCD -> cgetrf_64 (ILP64) -> rows of A^{-1} via blocked identity
-// cgetrs_64 + broadcast, each rank keeping the rows of its own sites -> save.
-// VERIFY ||A Ainv x - x||/||x|| runs in BOTH paths (and now certifies the DEVICE
-// slab + split-K path, since the single-RHS apply routes through the same core).
+// VERIFY ||A Ainv x - x||/||x|| certifies the DEVICE slab + split-K path at the
+// end of Import, since the single-RHS apply routes through the same core.
 //
-// Env: SLAB_FILE  DENSE_SPLITK (default 32, snapped to a divisor of N)
-//      DENSE_DEVICE_SUM  DENSE_IMPORT_SIGN  DENSE_APPLY_PROFILE  DENSE_CC_CHECK
-//      DENSE_SCHUR (0/absent: single-GCD gather-invert; 1: distributed
-//      recursive Schur; 2: AUDIT -- run BOTH on the same imported A, report
-//      the slab difference, keep the Schur result)  DENSE_PANEL_BYTES
-//
-// The DENSE_SCHUR=1 path is the RecursiveSchurInverse distributed
-// factorisation: it lifts the fp32 N ~ 90k boss-HBM ceiling (the CC-grid
-// 256-rank SIMD cap remains -- separate issue).  Internal only: slab layout,
-// apply path, SLAB_FILE format and VERIFY are identical in every mode.
-//
-// Tensor-depth agnostic: site scalar objects treated as contiguous ComplexD
+// Tensor-depth agnostic: site scalar objects treated as contiguous coarse
+// scalars (ComplexF or ComplexD, following the coefficient precision)
 // (iScalar wrappers add no data), so any MG level's coarse operator imports.
 //////////////////////////////////////////////////////////////////////////////////////
 //
@@ -101,6 +86,10 @@ public:
   typedef typename vobj::scalar_object  sobj;
   typedef typename CoarseMatrix::vector_object Mvobj;
   typedef typename Mvobj::scalar_object        Msobj;
+  // Scalar of the coarse site objects (ComplexF or ComplexD): the apply slab
+  // is always fp32 and the inversion always fp64, but the SOURCE of both --
+  // the coarse operator's matrix elements -- carries this precision.
+  typedef typename GridTypeMapper<CComplex>::scalar_type CoarseScalar;
 
   GridBase *grid;
   int      nd;
@@ -111,15 +100,15 @@ public:
   std::vector<int64_t>    myGsite;  // global lex site index of my site ss
   std::vector<ComplexF>   slab;     // nrows x N row-major: A during setup, rows of A^{-1} after
 
-  static const int64_t CHUNKROWS = 1024;  // getrs harvest block (trsm efficiency + fewer broadcasts)
   static const int MRHS_MAX = 32;
+  static const int SPLITK   = 32;   // requested split-K chunk count, snapped DOWN to a divisor of N
 
   // Apply machinery: resident slab + persistent buffers + AOT split-K pointers.
   GridBLAS BLAS;
   deviceVector<ComplexF>  dSlab;
   deviceVector<ComplexF>  dX;       // N x MRHS_MAX
   deviceVector<ComplexF>  dY;       // nrows x MRHS_MAX
-  deviceVector<ComplexF>  dG;       // N x MRHS_MAX lex-major staging for the allgather (devSum==4)
+  deviceVector<ComplexF>  dG;       // N x MRHS_MAX lex-major staging for the allgather
   deviceVector<int>       dLex2Rank;// lex index of a process coordinate -> its rank (allgather block order -> row-block order)
   deviceVector<int64_t>   dRm2G;    // rank-major index (rank*nrows + ss*nbasis + b) -> global column (gsite*nbasis + b) of x / the slab
   int                     myLex;
@@ -130,19 +119,25 @@ public:
   std::vector<ComplexF>   hX;
   std::vector<ComplexF>   hY;
   int NK;                           // split-K chunk count (divides N)
-  int devSum;
-  double schurAuditRel;             // DENSE_SCHUR=2: rel slab diff single-vs-schur (-1 = not run)
+
+  // Resident device memory: the apply slab and its staging.  deviceVector is
+  // not evictable, so this counts against the hard budget, not the cache.
+  uint64_t DeviceBytes(void)
+  {
+    return (uint64_t)(dSlab.capacity()+dX.capacity()+dY.capacity()+dG.capacity()+dPartial.capacity())*sizeof(ComplexF)
+         + (uint64_t)dLex2Rank.capacity()*sizeof(int)
+         + (uint64_t)dRm2G.capacity()*sizeof(int64_t);
+  }
 
   DenseCoarseMatrix(GridBase *g)
     : grid(g)
   {
-    GRID_ASSERT( sizeof(sobj)  == nbasis*sizeof(ComplexD) );
-    GRID_ASSERT( sizeof(Msobj) == nbasis*nbasis*sizeof(ComplexD) );
+    GRID_ASSERT( sizeof(sobj)  == nbasis*sizeof(CoarseScalar) );
+    GRID_ASSERT( sizeof(Msobj) == nbasis*nbasis*sizeof(CoarseScalar) );
     nd     = grid->_ndimension;
     N      = grid->gSites() * nbasis;
     lsites = grid->lSites();
     nrows  = (int64_t)lsites * nbasis;
-    schurAuditRel = -1.0;
 
     std::cout << GridLogMessage << "DenseCoarseMatrix: N = " << N
               << " (" << grid->gSites() << " sites x " << nbasis << ")"
@@ -180,47 +175,12 @@ public:
   void Import(CoarseOp &Op)
   {
     double t0 = usecond();
-    ////////////////////////////////////////////////////////////////////
-    // 0. Slab cache: SLAB_FILE=<stem> -> per-rank raw file <stem>.<rank>.
-    //    SAME format as the frozen example (interchange compatible).
-    ////////////////////////////////////////////////////////////////////
-    bool loaded = false;
-    char *sfile = getenv("SLAB_FILE");
-    std::string slabfile;
-    if (sfile) {
-      slabfile = std::string(sfile) + "." + std::to_string(grid->ThisRank());
-      FILE *f = fopen(slabfile.c_str(),"rb");
-      if (f) {
-        int64_t hdr[4] = {0,0,0,0};
-        GRID_ASSERT( fread(hdr,sizeof(int64_t),4,f) == 4 );
-        GRID_ASSERT( hdr[0] == (int64_t)0x44454E5345 );  // magic "DENSE"
-        GRID_ASSERT( hdr[1] == N && hdr[2] == (int64_t)nrows && hdr[3] == (int64_t)nbasis );
-        uint64_t nelem = (uint64_t)nrows * N;
-        GRID_ASSERT( fread(&slab[0], sizeof(ComplexF), nelem, f) == nelem );
-        fclose(f);
-        loaded = true;
-        std::cout << GridLogMessage << "DenseCoarseMatrix: slab loaded from "
-                  << slabfile << " -- skipping import/factor/solve" << std::endl;
-      } else {
-        std::cout << GridLogMessage << "DenseCoarseMatrix: slab cache " << slabfile
-                  << " absent -- full setup, will write it" << std::endl;
-      }
-    }
-    if (!loaded) {
+    {
+      CheckMrhsSlices(Op);    // the batched apply keeps its slices apart
       ImportDense(Op);        // slab <- my rows of A   (LOCAL, no comms)
       ImportCertificate(Op);  // dense apply == Op.M, before inversion
       InvertDense(Op);        // slab <- my rows of A^{-1}
       double t1 = usecond();
-      if (sfile) {
-        FILE *f = fopen(slabfile.c_str(),"wb");
-        GRID_ASSERT(f != nullptr);
-        int64_t hdr[4] = { (int64_t)0x44454E5345, N, (int64_t)nrows, (int64_t)nbasis };
-        GRID_ASSERT( fwrite(hdr,sizeof(int64_t),4,f) == 4 );
-        uint64_t nelem = (uint64_t)nrows * N;
-        GRID_ASSERT( fwrite(&slab[0], sizeof(ComplexF), nelem, f) == nelem );
-        fclose(f);
-        std::cout << GridLogMessage << "DenseCoarseMatrix: slab written to " << slabfile << std::endl;
-      }
       std::cout << GridLogMessage << "DenseCoarseMatrix: import+invert took "
                 << (t1-t0)/1.0e6 << " s" << std::endl;
     }
@@ -233,11 +193,9 @@ public:
       dSlab.resize((uint64_t)nrows*N);
       acceleratorCopyToDevice(&slab[0],&dSlab[0],sbytes);
 
-      // DENSE_SPLITK: requested chunk count, snapped DOWN to a divisor of N.
-      int req = getenv("DENSE_SPLITK") ? atoi(getenv("DENSE_SPLITK")) : 32;
-      if (req < 1) req = 1;
+      // Split-K chunk count, snapped DOWN to a divisor of N.
       NK = 1;
-      for(int j=1;j<=req;j++) if ( (N % j) == 0 ) NK = j;
+      for(int j=1;j<=SPLITK;j++) if ( (N % j) == 0 ) NK = j;
       int64_t Kc = N / NK;
 
       dX.resize((uint64_t)N*MRHS_MAX);
@@ -255,12 +213,7 @@ public:
       for(int j=0;j<NK;j++) h[j] = &dPartial[0] + (uint64_t)j*nrows*MRHS_MAX;  // compact, ldc=nrows
       acceleratorCopyToDevice(&h[0],&cptrs[0],NK*sizeof(ComplexF*));
 
-      devSum = getenv("DENSE_DEVICE_SUM") ? atoi(getenv("DENSE_DEVICE_SUM")) : 0;
-      const char *sumName[5] = {"host allreduce","DEVICE-buffer allreduce (GPU-aware MPI)",
-                                "DEVICE cartesian ring allreduce (P2P)","DEVICE flat ring allreduce (P2P)",
-                                "DEVICE cartesian ring ALLGATHER (P2P, ~8x fewer bytes than the padded allreduce)"};
-      GRID_ASSERT(devSum>=0 && devSum<=4);
-      if ( devSum==4 ) {
+      {
         dG.resize((uint64_t)N*MRHS_MAX);
         // allgather delivers blocks in lexicographic-coordinate order; the row
         // blocks of x are in RANK order.  Same table as BuildRankMajorMap.
@@ -273,8 +226,7 @@ public:
         GRID_ASSERT( l2r[myLex] == grid->ThisRank() );
         // x and the slab columns are in GLOBAL-SITE order (hX[myGsite*nbasis+b]);
         // the gathered blocks are in RANK-MAJOR order (rank*nrows + ss*nbasis + b).
-        // On one rank the two coincide, which is how the laptop passed while
-        // Frontier VERIFYed 0.9965 (2026-08-27).  Scatter through the inverse map.
+        // The two coincide only on one rank, so scatter through the inverse map.
         std::vector<int64_t> g2rm; BuildRankMajorMap(g2rm);
         std::vector<int64_t> rm2g(N); for(int64_t g=0; g<N; g++) rm2g[g2rm[g]] = g;
         for(int ss=0; ss<lsites; ss++) GRID_ASSERT( rm2g[(int64_t)grid->ThisRank()*nrows + (int64_t)ss*nbasis] == myGsite[ss]*nbasis );
@@ -282,8 +234,8 @@ public:
         acceleratorCopyToDevice(&rm2g[0], &dRm2G[0], N*sizeof(int64_t));
       }
       std::cout << GridLogMessage << "DenseCoarseMatrix: slab resident on device ("
-                << sbytes/1024./1024. << " MB/rank), split-K NK=" << NK << " (Kc=" << Kc << "); "
-                << sumName[devSum] << std::endl;
+                << sbytes/1024./1024. << " MB/rank), split-K NK=" << NK << " (Kc=" << Kc
+                << "); DEVICE cartesian ring ALLGATHER (P2P)" << std::endl;
     }
 
     ////////////////////////////////////////////////////////////////////
@@ -291,7 +243,7 @@ public:
     ////////////////////////////////////////////////////////////////////
     {
       Field x(grid); Field y(grid); Field z(grid);
-      x = ComplexD(1.0,0.0);
+      x = CoarseScalar(1.0,0.0);
       double ta = usecond();
       (*this)(x, y);
       double tb = usecond();
@@ -323,27 +275,67 @@ public:
     GRID_ASSERT(mgrid->_ndimension == nd+1);
     int nr = mgrid->_fdimensions[0];
 
+    // Every slice carries the same vector; slice 0 is the answer.  The
+    // slices are not a check here -- see CheckMrhsSlices, which does that
+    // once on a field chosen for the purpose.
+    Field min(mgrid), mout(mgrid);
+    for(int r=0;r<nr;r++) InsertSliceFast(in,min,r,0);
+    Op.M(min,mout);
+    ExtractSliceFast(out,mout,0,0);
+  }
+
+  ////////////////////////////////////////////////////////////////////
+  // Do the multiRHS slices stay independent?  Slice r carries (r+1) times
+  // one RANDOM field, so linearity says the results scale likewise, and a
+  // slot reading another slot's data is an O(1) error.
+  //
+  // The field is random on purpose.  Run on the output of the inverse, as
+  // this check once was, it measures the cancellation in A applied to
+  // A^-1 x instead: at the production point that is 1.3e-4 in an fp32
+  // sector with an fp32 inversion, so the check then fires on any change
+  // of summation order while saying nothing about slice independence.
+  // Once per import, not per apply.
+  ////////////////////////////////////////////////////////////////////
+  template<class CoarseOp>
+  void CheckMrhsSlices(CoarseOp &Op)
+  {
+    if ( Op.Grid() == grid ) return;               // single rhs: nothing to mix
+
+    GridBase *mgrid = Op.Grid();
+    GRID_ASSERT(mgrid->_ndimension == nd+1);
+    int nr = mgrid->_fdimensions[0];
+    if ( nr < 2 ) return;
+
+    Field in(grid);
+    GridParallelRNG rng(grid); rng.SeedFixedIntegers(std::vector<int>({7,8,9,10}));
+    random(rng,in);
+
     Field min(mgrid), mout(mgrid);
     for(int r=0;r<nr;r++){
       Field scaled(grid);
-      scaled = ComplexD(r+1.0,0.0)*in;
+      scaled = CoarseScalar(r+1.0,0.0)*in;
       InsertSliceFast(scaled,min,r,0);
     }
-
     Op.M(min,mout);
 
-    ExtractSliceFast(out,mout,0,0);
+    Field s0(grid);
+    ExtractSliceFast(s0,mout,0,0);
+    RealD worst=0.0;
     for(int r=1;r<nr;r++){
       Field sr(grid),d(grid);
       ExtractSliceFast(sr,mout,r,0);
-      d = sr - ComplexD(r+1.0,0.0)*out;
+      d = sr - CoarseScalar(r+1.0,0.0)*s0;
       RealD rel = std::sqrt(norm2(d)/norm2(sr));
-      if ( rel >= 1.0e-6 ) {
-        std::cout << GridLogMessage << "DenseCoarseMatrix: oracle rhs "<<r
-                  <<" inconsistent with rhs 0, rel "<<rel<<std::endl;
+      worst = std::max(worst,rel);
+      const RealD otol = (sizeof(CoarseScalar)==sizeof(ComplexF)) ? 1.0e-4 : 1.0e-6;
+      if ( rel >= otol ) {
+        std::cout << GridLogMessage << "DenseCoarseMatrix: mrhs slice "<<r
+                  <<" inconsistent with slice 0, rel "<<rel<<std::endl;
       }
-      GRID_ASSERT( rel < 1.0e-6 );
+      GRID_ASSERT( rel < otol );
     }
+    std::cout << GridLogMessage << "DenseCoarseMatrix: mrhs slices independent to "
+              << worst << " over " << nr << " right hand sides" << std::endl;
   }
 
   ////////////////////////////////////////////////////////////////////
@@ -355,55 +347,31 @@ public:
   {
     double t = -usecond();
     Coordinate gdims = grid->GlobalDimensions();
-    int sign = getenv("DENSE_IMPORT_SIGN") ? atoi(getenv("DENSE_IMPORT_SIGN")) : 1;
-    GRID_ASSERT( sign==1 || sign==-1 );
 
     uint64_t nelem = (uint64_t)nrows * N;
     thread_for(i, nelem, { slab[i] = ComplexF(0.0,0.0); });
 
     for(int p=0; p<Op.Geometry().npoint; p++){
       Coordinate shift = Op.Geometry().shifts[p];
-      // _A[p] is PADDED after ExchangeCoarseLinks (end of CoarsenOperator):
-      // extract the unpadded field before peeking with unpadded coordinates
-      // (exactly as MultiGeneralCoarsenedMatrix::CopyMatrix does).
+      // ExtractMatrix hands back the unpadded matrix field, which is what the
+      // unpadded coordinates below index.
       CoarseMatrix Aun(grid);  Op.ExtractMatrix(p,Aun);
-      if ( getenv("DENSE_IMPORT_DEBUG") ) {
-        // Peek-path vs field-norm audit: sum |peekLocalSite|^2 must match norm2
-        double pk = 0.0;
-        autoView(Adbg, Aun, CpuRead);
-        for(int ss=0; ss<lsites; ss++){
-          Msobj m;
-          peekLocalSite(m, Adbg, myLcoor[ss]);
-          ComplexD *md = (ComplexD *)&m;
-          for(int i=0; i<nbasis*nbasis; i++) pk += md[i].real()*md[i].real() + md[i].imag()*md[i].imag();
-        }
-        RealD gpk = pk;
-        grid->GlobalSumVector(&gpk, 1);
-        std::cout << GridLogMessage << "DenseCoarseMatrix: DEBUG p=" << p
-                  << " norm2(_A[p]) " << norm2(Aun)
-                  << " norm2(Extract) " << norm2(Aun)
-                  << " sum|peek|^2 " << gpk << std::endl;
-      }
       autoView(Av, Aun, CpuRead);
       thread_for(ss, lsites, {
         Coordinate ncoor(nd);
         for(int d=0; d<nd; d++){
-          int64_t g = grid->_lstart[d] + myLcoor[ss][d] + sign*shift[d];
+          int64_t g = grid->_lstart[d] + myLcoor[ss][d] + shift[d];
           ncoor[d] = (int)((g % gdims[d] + gdims[d]) % gdims[d]);
         }
         int64_t nsite;
         Lexicographic::IndexFromCoor(ncoor, nsite, gdims);
         Msobj m;
         peekLocalSite(m, Av, myLcoor[ss]);
-        ComplexD *md = (ComplexD *)&m;
+        CoarseScalar *md = (CoarseScalar *)&m;
         // The operator contracts out(s,b) = sum_a A[p](s)(a,b) in(nbr,a)
         // (GeneralCoarsenedMatrix.h Mult kernel): the stored site matrix
         // acts TRANSPOSED, so element (a,b) lands at dense row (s,b),
-        // column (nbr,a).  BUG LEDGER 2026-08-14: the original mapping
-        // wrote (s,a),(nbr,b) -- caught by the IMPORT CERTIFICATE on its
-        // FIRST fresh-import exercise (Test_schur_dense_coarse); every
-        // production slab predates this path (probe-import SLAB_FILEs),
-        // so no production output is suspect.
+        // column (nbr,a).
         for(int b=0; b<nbasis; b++){
           ComplexF *row = &slab[(uint64_t)(ss*nbasis+b)*N + nsite*nbasis];
           for(int a=0; a<nbasis; a++)
@@ -468,7 +436,7 @@ public:
       sobj s;
       for(int b=0; b<nbasis; b++){
         double ph = 0.37*(double)(myGsite[ss]*nbasis+b);
-        ((ComplexD *)&s)[b] = ComplexD(std::cos(ph),std::sin(0.61*ph));
+        ((CoarseScalar *)&s)[b] = CoarseScalar(std::cos(ph),std::sin(0.61*ph));
       }
       pokeLocalSite(s, x, myLcoor[ss]);
     }
@@ -477,7 +445,7 @@ public:
     for(int ss=0; ss<lsites; ss++){
       sobj s;
       peekLocalSite(s, x, myLcoor[ss]);
-      for(int b=0; b<nbasis; b++) xh[ myGsite[ss]*nbasis + b ] = ((ComplexD *)&s)[b];
+      for(int b=0; b<nbasis; b++) xh[ myGsite[ss]*nbasis + b ] = ComplexD(((CoarseScalar *)&s)[b]);
     }
     grid->GlobalSumVector(&xh[0], (int)N);
     std::vector<ComplexD> yh(nrows);
@@ -489,7 +457,7 @@ public:
     });
     for(int ss=0; ss<lsites; ss++){
       sobj s;
-      for(int b=0; b<nbasis; b++) ((ComplexD *)&s)[b] = yh[ss*nbasis+b];
+      for(int b=0; b<nbasis; b++) ((CoarseScalar *)&s)[b] = CoarseScalar(yh[ss*nbasis+b]);
       pokeLocalSite(s, Dx, myLcoor[ss]);
     }
     ApplyOracle(Op, x, Ax);
@@ -499,250 +467,15 @@ public:
               << rel << std::endl;
     if ( rel >= 1.0e-3 ) {
       std::cout << GridLogMessage << "DenseCoarseMatrix: IMPORT CERTIFICATE FAILED. If O(1), the "
-                << "stencil shift-sign convention is opposite: rerun with DENSE_IMPORT_SIGN=-1"
+                << "stencil shift-sign convention of the coarse operator has changed: "
+                << "the import in ImportDense/ImportDenseForInversion must change with it"
                 << std::endl;
     }
     GRID_ASSERT(rel < 1.0e-3);
   }
 
   ////////////////////////////////////////////////////////////////////
-  // 3. Invert dispatcher.  slab holds my rows of A on entry, my rows
-  //    of A^{-1} on exit, in every mode.
-  //      DENSE_SCHUR absent/0 : single-GCD gather-invert (the oracle)
-  //      DENSE_SCHUR=1        : distributed recursive Schur
-  //      DENSE_SCHUR=2        : AUDIT -- both on the same A; report the
-  //                             slab difference; keep the Schur result
-  //                             (so VERIFY certifies the new path).
-  ////////////////////////////////////////////////////////////////////
-  template<class CoarseOp>
-  void InvertDense(CoarseOp &Op)
-  {
-    char *sc  = getenv("DENSE_SCHUR");
-    int  mode = sc ? atoi(sc) : 0;
-
-    if ( mode == 0 )
-    {
-      InvertDenseSingle();
-      return;
-    }
-    if ( mode == 1 )
-    {
-      InvertDenseSchur(Op);
-      return;
-    }
-    GRID_ASSERT( mode == 2 );
-    std::vector<ComplexF> Aimp(slab);       // imported A
-    InvertDenseSingle();
-    std::vector<ComplexF> ref(slab);        // Ainv, single path
-    slab = Aimp;
-    InvertDenseSchur(Op);                   // slab = Ainv, Schur path
-
-    // NaN-PROOF comparison: max() masks NaN, so count non-finite
-    // entries in each result explicitly.
-    double  mx = 0.0;
-    double  mr = 0.0;
-    int64_t badschur  = 0;
-    int64_t badsingle = 0;
-    for(uint64_t i=0; i<(uint64_t)nrows*N; i++)
-    {
-      double as = abs(ComplexD(slab[i]));
-      double ar = abs(ComplexD(ref[i]));
-      if ( !std::isfinite(as) ) badschur++;
-      if ( !std::isfinite(ar) ) badsingle++;
-      if ( std::isfinite(as) && std::isfinite(ar) )
-      {
-        mx = std::max(mx, (double)abs(ComplexD(slab[i]) - ComplexD(ref[i])));
-        mr = std::max(mr, ar);
-      }
-    }
-    RealD gmx = mx;
-    RealD gmr = mr;
-    RealD gbs = (RealD)badschur;
-    RealD gbr = (RealD)badsingle;
-    grid->GlobalMax(gmx);
-    grid->GlobalMax(gmr);
-    grid->GlobalSumVector(&gbs, 1);
-    grid->GlobalSumVector(&gbr, 1);
-    schurAuditRel = gmx/gmr;
-    std::cout << GridLogMessage << "DenseCoarseMatrix: DENSE_SCHUR=2 AUDIT "
-              << "max|Ainv_schur - Ainv_single| = " << gmx
-              << "  relative " << schurAuditRel
-              << "  non-finite: schur " << (int64_t)gbs << " single " << (int64_t)gbr
-              << "  (two fp32 roundings of the same inverse; expect ~ growth * eps32)"
-              << std::endl;
-    GRID_ASSERT( gbs == 0 );
-    GRID_ASSERT( gbr == 0 );
-  }
-
-  ////////////////////////////////////////////////////////////////////
-  // 3a. Single-GCD invert: chunked zero-fill+GlobalSum gather of A
-  //    streamed to the boss GCD, cgetrf_64 (ILP64), rows of A^{-1} by
-  //    blocked identity cgetrs_64 + broadcast; each rank keeps its own
-  //    rows (in `slab`, overwriting A).  Proven path; the SCHUR oracle.
-  ////////////////////////////////////////////////////////////////////
-  void InvertDenseSingle(void)
-  {
-    double t1 = usecond();
-    int boss = grid->IsBoss();
-    std::vector<ComplexF> Afull;
-#ifdef GRID_HIP
-    // QUARANTINED naked HIP: the boss-only N^2 inversion buffer (34GB at
-    // N=65536) must come from raw HBM; EvictAll flushes the device-copy
-    // layer to make the window.  (FreePool of the allocator free-list
-    // awaits the type-dispatched fix.)  Confined to setup; the apply path
-    // is pure Grid primitives.
-    rocblas_float_complex *dA = nullptr;
-    rocblas_float_complex *dB = nullptr;
-    int64_t *dIpiv = nullptr;
-    uint64_t Abytes = (uint64_t)N * N * sizeof(ComplexF);
-    MemoryManager::EvictAll();
-    if (boss) {
-      auto aerr = hipMalloc((void **)&dA, Abytes);
-      if (aerr != hipSuccess) {
-        std::cout << GridLogMessage << "DenseCoarseMatrix: hipMalloc of "
-                  << Abytes/1024./1024./1024. << " GB FAILED -- reduce --device-mem" << std::endl;
-        GRID_ASSERT(aerr == hipSuccess);
-      }
-      std::cout << GridLogMessage << "DenseCoarseMatrix: device inversion buffer allocated ("
-                << Abytes/1024./1024./1024. << " GB)" << std::endl;
-    }
-#else
-    if (boss) Afull.resize((uint64_t)N * N);
-#endif
-    {
-      std::unordered_map<int64_t,int> rowmap;   // global row -> my slab row
-      for(int ss=0; ss<lsites; ss++)
-        for(int a=0; a<nbasis; a++)
-          rowmap[ myGsite[ss]*nbasis + a ] = ss*nbasis + a;
-
-      std::vector<ComplexF> chunk((uint64_t)CHUNKROWS * N);
-      for(int64_t row0=0; row0<N; row0+=CHUNKROWS){
-        int64_t nrow = std::min(CHUNKROWS, N-row0);
-        uint64_t nelem = (uint64_t)nrow * N;
-        for(uint64_t i=0;i<nelem;i++) chunk[i]=ComplexF(0.0,0.0);
-        for(int64_t r=row0; r<row0+nrow; r++){
-          auto it = rowmap.find(r);
-          if (it != rowmap.end()) {
-            uint64_t src = (uint64_t)(it->second) * N;
-            uint64_t dst = (uint64_t)(r-row0) * N;
-            for(int64_t j=0;j<N;j++) chunk[dst+j] = slab[src+j];
-          }
-        }
-        grid->GlobalSumVector(&chunk[0], (int)nelem);
-        if (boss) {
-#ifdef GRID_HIP
-          GRID_ASSERT( hipMemcpy((char *)dA + (uint64_t)row0*N*sizeof(ComplexF),
-                                 &chunk[0], nelem*sizeof(ComplexF),
-                                 hipMemcpyHostToDevice) == hipSuccess );
-#else
-          uint64_t dst = (uint64_t)row0 * N;
-          for(uint64_t i=0;i<nelem;i++) Afull[dst+i] = chunk[i];
-#endif
-        }
-      }
-    }
-    double t2 = usecond();
-    std::cout << GridLogMessage << "DenseCoarseMatrix: gather to boss took "
-              << (t2-t1)/1.0e6 << " s" << std::endl;
-
-    ////////////////////////////////////////////////////////////////////
-    // Factor in place on the boss (fp32, ILP64).  Row-major buffer handed
-    // to column-major LAPACK => LU of A^T.
-    ////////////////////////////////////////////////////////////////////
-    if (boss) {
-#ifdef GRID_HIP
-      std::cout << GridLogMessage << "DenseCoarseMatrix: rocSOLVER cgetrf_64 (ILP64 LU) N=" << N
-                << " in place on resident device buffer" << std::endl;
-      rocblas_handle handle = GridBLASInverse::Handle();
-      int64_t *dInfo;
-      GRID_ASSERT( hipMalloc((void **)&dIpiv, N*sizeof(int64_t)) == hipSuccess );
-      GRID_ASSERT( hipMalloc((void **)&dInfo, sizeof(int64_t))   == hipSuccess );
-      auto st1 = rocsolver_cgetrf_64(handle, (int64_t)N, (int64_t)N, dA, (int64_t)N, dIpiv, dInfo);
-      GRID_ASSERT( hipDeviceSynchronize() == hipSuccess );
-      int64_t info_h = -1;
-      GRID_ASSERT( hipMemcpy(&info_h, dInfo, sizeof(int64_t),
-                             hipMemcpyDeviceToHost) == hipSuccess );
-      std::cout << GridLogMessage << "DenseCoarseMatrix: cgetrf_64 status " << (int)st1
-                << " info = " << (int)info_h << std::endl;
-      GRID_ASSERT(st1 == rocblas_status_success);
-      GRID_ASSERT(info_h == 0);
-      GRID_ASSERT( hipFree(dInfo) == hipSuccess );
-      GRID_ASSERT( hipMalloc((void **)&dB, (uint64_t)CHUNKROWS*N*sizeof(ComplexF)) == hipSuccess );
-      // dA holds the LU of A^T; rows of A^{-1} are produced blockwise below via
-      // cgetrs_64 on identity-column blocks: A^T X = E => X columns = rows of
-      // A^{-1}, in exactly the linear layout the harvest expects.
-#else
-      // Eigen fallback: small local CPU tests only.
-      std::cout << GridLogMessage << "DenseCoarseMatrix: Eigen fallback inversion N=" << N
-                << (N > 10000 ? "  (WARNING: SLOW; use the HIP/rocSOLVER path)" : "")
-                << std::endl;
-      typedef Eigen::Matrix<std::complex<float>,Eigen::Dynamic,Eigen::Dynamic,Eigen::RowMajor> MatF;
-      Eigen::Map<MatF> A(reinterpret_cast<std::complex<float>*>(&Afull[0]), N, N);
-      MatF Ainv = A.inverse();
-      A = Ainv;
-#endif
-    }
-    double t3 = usecond();
-    std::cout << GridLogMessage << "DenseCoarseMatrix: factorisation took "
-              << (t3-t2)/1.0e6 << " s" << std::endl;
-
-    ////////////////////////////////////////////////////////////////////
-    // Blocked solve + broadcast: rows of A^{-1} chunk by chunk; each
-    // rank keeps the rows of its own sites (ownership-aligned).
-    ////////////////////////////////////////////////////////////////////
-    {
-      std::unordered_map<int64_t,int> rowmap;
-      for(int ss=0; ss<lsites; ss++)
-        for(int a=0; a<nbasis; a++)
-          rowmap[ myGsite[ss]*nbasis + a ] = ss*nbasis + a;
-
-      std::vector<ComplexF> chunk((uint64_t)CHUNKROWS * N);
-      for(int64_t row0=0; row0<N; row0+=CHUNKROWS){
-        int64_t nrow = std::min(CHUNKROWS, N-row0);
-        uint64_t nelem = (uint64_t)nrow * N;
-        if (boss) {
-#ifdef GRID_HIP
-          // Identity block E: column j = e_{row0+j}; solve A^T X = E so X's
-          // columns are rows [row0,row0+nrow) of A^{-1}.
-          for(uint64_t i=0;i<nelem;i++) chunk[i] = ComplexF(0.0,0.0);
-          for(int64_t j=0;j<nrow;j++) chunk[(uint64_t)j*N + (uint64_t)(row0+j)] = ComplexF(1.0,0.0);
-          GRID_ASSERT( hipMemcpy(dB, &chunk[0], nelem*sizeof(ComplexF), hipMemcpyHostToDevice) == hipSuccess );
-          auto strs = rocsolver_cgetrs_64(GridBLASInverse::Handle(), rocblas_operation_none,
-                                          (int64_t)N, (int64_t)nrow,
-                                          dA, (int64_t)N, dIpiv, dB, (int64_t)N);
-          GRID_ASSERT(strs == rocblas_status_success);
-          GRID_ASSERT( hipDeviceSynchronize() == hipSuccess );
-          GRID_ASSERT( hipMemcpy(&chunk[0], dB, nelem*sizeof(ComplexF), hipMemcpyDeviceToHost) == hipSuccess );
-#else
-          uint64_t src = (uint64_t)row0 * N;
-          for(uint64_t i=0;i<nelem;i++) chunk[i] = Afull[src+i];
-#endif
-        }
-        grid->Broadcast(0, &chunk[0], nelem*sizeof(ComplexF));
-        for(int64_t r=row0; r<row0+nrow; r++){
-          auto it = rowmap.find(r);
-          if (it != rowmap.end()) {
-            uint64_t dst = (uint64_t)(it->second) * N;
-            uint64_t src = (uint64_t)(r-row0) * N;
-            for(int64_t j=0;j<N;j++) slab[dst+j] = chunk[src+j];
-          }
-        }
-      }
-    }
-#ifdef GRID_HIP
-    if (boss) {
-      if (dA)    GRID_ASSERT( hipFree(dA)    == hipSuccess );
-      if (dB)    GRID_ASSERT( hipFree(dB)    == hipSuccess );
-      if (dIpiv) GRID_ASSERT( hipFree(dIpiv) == hipSuccess );
-    }
-#endif
-    double t4 = usecond();
-    std::cout << GridLogMessage << "DenseCoarseMatrix: blocked getrs solve+scatter took "
-              << (t4-t3)/1.0e6 << " s" << std::endl;
-  }
-
-  ////////////////////////////////////////////////////////////////////
-  // 3b. Global column -> rank-major column map, computed LOCALLY.
+  // 3a. Global column -> rank-major column map, computed LOCALLY.
   //    Rank-major ordering: rank q's rows/columns are the contiguous
   //    block [q*nrows, (q+1)*nrows), ordered by q's local site index
   //    (uniform local volumes make ownership arithmetic exact).
@@ -789,26 +522,25 @@ public:
   }
 
   ////////////////////////////////////////////////////////////////////
-  // 3c. Direct stencil -> fp64 rank-major import of MY ROWS of A (the
-  //    end-to-end fp64 path: the stencil source IS ComplexD; nothing is
-  //    rounded through fp32 on the way into the inversion).  Same
+  // 3b. Direct stencil -> rank-major import of MY ROWS of A in the
+  //    inversion precision (DenseInverseScalar): the stencil source is
+  //    read once, straight into the buffer the Schur recursion factorises,
+  //    never via the fp32 apply slab.  Same
   //    loop/sign/accumulate/transposed-contraction discipline as
   //    ImportDense; output is column-major rows x N with columns in
   //    rank-major order (g2rm).
-  //    ALWAYS-ON CERTIFICATE: the fp64 import, rounded, must agree with
+  //    ALWAYS-ON CERTIFICATE: this import, rounded, must agree with
   //    the fp32 slab entry at the corresponding global column, over the
   //    WHOLE of my rows (few ulp: wrapped-shift collisions accumulate in
   //    different precision order).  NaN-proof: non-finite entries are
   //    counted explicitly since max() silently masks NaN.
   ////////////////////////////////////////////////////////////////////
   template<class CoarseOp>
-  void ImportDenseFP64(CoarseOp &Op, BlockRows &S, std::vector<int64_t> &g2rm)
+  void ImportDenseForInversion(CoarseOp &Op, BlockRows &S, std::vector<int64_t> &g2rm)
   {
     Coordinate gdims = grid->GlobalDimensions();
-    int sign = getenv("DENSE_IMPORT_SIGN") ? atoi(getenv("DENSE_IMPORT_SIGN")) : 1;
-    GRID_ASSERT( sign==1 || sign==-1 );
 
-    std::vector<ComplexD> h((uint64_t)nrows*N, ComplexD(0.0,0.0));
+    std::vector<DenseInverseScalar> h((uint64_t)nrows*N, DenseInverseScalar(0.0,0.0));
     for(int p=0; p<Op.Geometry().npoint; p++)
     {
       Coordinate shift = Op.Geometry().shifts[p];
@@ -818,14 +550,14 @@ public:
         Coordinate ncoor(nd);
         for(int d=0; d<nd; d++)
         {
-          int64_t g = grid->_lstart[d] + myLcoor[ss][d] + sign*shift[d];
+          int64_t g = grid->_lstart[d] + myLcoor[ss][d] + shift[d];
           ncoor[d] = (int)((g % gdims[d] + gdims[d]) % gdims[d]);
         }
         int64_t nsite;
         Lexicographic::IndexFromCoor(ncoor, nsite, gdims);
         Msobj m;
         peekLocalSite(m, Av, myLcoor[ss]);
-        ComplexD *md = (ComplexD *)&m;
+        CoarseScalar *md = (CoarseScalar *)&m;
         // Transposed contraction as ImportDense: (a,b) lands at
         // row (s,b), column (nbr,a); column index in rank-major order.
         for(int a=0; a<nbasis; a++)
@@ -833,7 +565,7 @@ public:
           int64_t jj = g2rm[ nsite*nbasis + a ];
           for(int b=0; b<nbasis; b++)
           {
-            h[(uint64_t)(ss*nbasis+b) + (uint64_t)jj*nrows] += md[a*nbasis+b];
+            h[(uint64_t)(ss*nbasis+b) + (uint64_t)jj*nrows] += DenseInverseScalar(md[a*nbasis+b]);
           }
         }
       });
@@ -846,7 +578,7 @@ public:
     {
       for(int64_t gcol=0; gcol<N; gcol++)
       {
-        ComplexD d64 = h[(uint64_t)(i + g2rm[gcol]*nrows)];
+        ComplexD d64 = ComplexD(h[(uint64_t)(i + g2rm[gcol]*nrows)]);
         ComplexF f32 = slab[(uint64_t)i*N + gcol];
         double dev = abs(ComplexD(f32) - d64);
         if ( !std::isfinite(dev) ) nbad++;
@@ -857,25 +589,25 @@ public:
     RealD gbad = (RealD)nbad;
     grid->GlobalMax(gmx);
     grid->GlobalSumVector(&gbad, 1);
-    std::cout << GridLogMessage << "DenseCoarseMatrix: fp64 import certificate "
-              << "max|A64 - A32| = " << gmx
+    std::cout << GridLogMessage << "DenseCoarseMatrix: inversion-source import certificate "
+              << "max|A_inv - A_slab| = " << gmx
               << "  non-finite entries " << (int64_t)gbad << std::endl;
     GRID_ASSERT( gbad == 0 );
     GRID_ASSERT( gmx < 1.0e-5 );
 
     S.Resize(nrows, N);
-    acceleratorCopyToDevice(&h[0], &S.data[0], (uint64_t)nrows*N*sizeof(ComplexD));
+    acceleratorCopyToDevice(&h[0], &S.data[0], (uint64_t)nrows*N*sizeof(DenseInverseScalar));
   }
 
   ////////////////////////////////////////////////////////////////////
-  // 3d. Distributed recursive Schur invert, END-TO-END fp64 (decision
-  //    2026-08-14): stencil (ComplexD) -> fp64 rank-major import ->
-  //    fp64 recursion -> ONE terminal rounding into the fp32 apply
-  //    slab.  Everything downstream (device residency, split-K apply,
-  //    VERIFY, SLAB_FILE) is untouched.
+  // 3c. The inverse: distributed recursive Schur, end to end in the
+  //    inversion precision (DenseInverseScalar, a configure-time choice):
+  //    stencil -> rank-major import -> recursion -> ONE terminal rounding
+  //    into the fp32 apply slab.  Everything downstream (device
+  //    residency, split-K apply, VERIFY) is fp32 regardless.
   ////////////////////////////////////////////////////////////////////
   template<class CoarseOp>
-  void InvertDenseSchur(CoarseOp &Op)
+  void InvertDense(CoarseOp &Op)
   {
     double t1 = usecond();
     int P  = grid->ProcessorCount();
@@ -902,29 +634,20 @@ public:
     }
 
     BlockRows S;
-    ImportDenseFP64(Op, S, g2rm);
+    ImportDenseForInversion(Op, S, g2rm);
 
     ////////////////////////////////////////////////////////////////
-    // DENSE_SCHUR2D=1 : invert via the 2D block-cyclic recursion
-    // (BlockCyclicSchurInverse) instead of the 1D rank-range one.
-    // The SAME imported rank-major rows S go in and come back, so the
-    // import certificate above and the slab rounding / VERIFY below are
-    // identical for both paths: a clean A/B on one imported operator.
-    //
-    // Everything in the 2D path -- redistribution, SUMMA rings, leaf --
-    // is point-to-point SendToRecvFrom; no collectives at all.
-    // DENSE_NB overrides the block size (default: rows-per-rank, which
-    // makes the redistribution edges maximally regular).
+    // The 2D block-cyclic recursion (BlockCyclicSchurInverse).
+    // Everything in it -- redistribution, SUMMA rings, leaves -- is
+    // point-to-point SendToRecvFrom; no collectives at all.  Block size
+    // nb = rows-per-rank makes the redistribution edges maximally
+    // regular.
     ////////////////////////////////////////////////////////////////
-    int use2d = getenv("DENSE_SCHUR2D") ? atoi(getenv("DENSE_SCHUR2D")) : 0;
-    int64_t panelBytes = getenv("DENSE_PANEL_BYTES") ? atol(getenv("DENSE_PANEL_BYTES"))
-                                                     : (int64_t)1024*1024*1024;   // 1D path only
     double t2, t3;
-    if ( use2d )
     {
       int Pr,Pc;
       BlockCyclicLayout::ChooseProcessGrid(P, Pr, Pc);
-      int64_t nb = getenv("DENSE_NB") ? atol(getenv("DENSE_NB")) : nrows;
+      int64_t nb = nrows;
       GRID_ASSERT( nb >= 1 );
       std::cout << GridLogMessage << "DenseCoarseMatrix: 2D SCHUR invert, process grid "
                 << Pr << " x " << Pc << "  nb " << nb
@@ -938,20 +661,12 @@ public:
       t3 = usecond();
       RSI2.ReportTelemetry(grid);
     }
-    else
-    {
-      RecursiveSchurInverse RSI(grid, N, rowStart, panelBytes);
-      t2 = usecond();
-      RSI.Invert(S);
-      t3 = usecond();
-      RSI.ReportTelemetry();
-    }
 
     // The single terminal rounding: fp64 inverse -> fp32 apply slab
     // (row-major, global columns)
     {
-      std::vector<ComplexD> h((uint64_t)nrows*N);
-      acceleratorCopyFromDevice(&S.data[0], &h[0], (uint64_t)nrows*N*sizeof(ComplexD));
+      std::vector<DenseInverseScalar> h((uint64_t)nrows*N);
+      acceleratorCopyFromDevice(&S.data[0], &h[0], (uint64_t)nrows*N*sizeof(DenseInverseScalar));
       thread_for(gcol, N, {
         int64_t jj = g2rm[gcol];
         for(int64_t i=0; i<nrows; i++)
@@ -961,29 +676,29 @@ public:
       });
     }
     double t4 = usecond();
-    std::cout << GridLogMessage << "DenseCoarseMatrix: SCHUR fp64 distributed invert took "
-              << (t4-t1)/1.0e6 << " s (recursion " << (t3-t2)/1.0e6 << " s), panelBytes "
-              << panelBytes << std::endl;
+    std::cout << GridLogMessage << "DenseCoarseMatrix: SCHUR "
+              << (sizeof(DenseInverseScalar)==sizeof(ComplexF) ? "fp32" : "fp64")
+              << " distributed invert took "
+              << (t4-t1)/1.0e6 << " s (recursion " << (t3-t2)/1.0e6 << " s)" << std::endl;
   }
 
   ////////////////////////////////////////////////////////////////////
   // CORE apply on packed data: hX[N x nr] (zero-filled, my sites only)
-  // -> allreduce -> split-K GEMM against the resident slab -> reduce
-  // partials -> hY[nrows x nr] (column major).  Platform-agnostic:
+  // -> ring allgather -> split-K GEMM against the resident slab ->
+  // reduce partials -> hY[nrows x nr] (column major).  Platform-agnostic:
   // deviceVector + GridBLAS (Eigen fallback on CPU builds).
-  // fp32 allreduce is EXACT: zero-fill assembly gives every element
-  // exactly one contributing rank.
+  // tprof (optional): per-phase microseconds {allgather, H2D, gemm+reduce,
+  // D2H}, printed by the caller on GridLogPerformance.
   ////////////////////////////////////////////////////////////////////
   void SlabApplyPacked(int nr, double *tprof)
   {
     GRID_TRACE("DenseSlabApply");
     GRID_ASSERT(nr <= MRHS_MAX);
-    uint64_t nX = (uint64_t)N * nr;
     uint64_t nY = (uint64_t)nrows * nr;
     int64_t  Kc = N / NK;
     double t1 = usecond();
     double t2, t3;
-    if (devSum==4) {
+    {
       // ALLGATHER: x is not a reduction -- every rank owns the rows of x at
       // global columns myGsite[ss]*nbasis+b (scattered by site coordinate, NOT
       // a contiguous block) and needs all of it.  Only MY rows go host->device
@@ -1009,31 +724,6 @@ public:
           int64_t L = gi / nrw;  int64_t i  = gi - L*nrw;
           x[r*NN + rm2g[(int64_t)l2r[L]*nrw + i]] = g[L*(nrw*nrr) + r*nrw + i];
         });
-      }
-      t3 = usecond();
-    } else if (devSum) {
-      { GRID_TRACE("DenseH2D");
-        acceleratorCopyToDevice(&hX[0],&dX[0],nX*sizeof(ComplexF));
-      }
-      t2 = usecond();
-      { GRID_TRACE("DenseAllreduce");
-        // DENSE_DEVICE_SUM=1 : device-buffer MPI_Allreduce (Cray MPICH aborts
-        //                      above ~8 MB: 12 RHS at N=138240 is 13.3 MB)
-        // DENSE_DEVICE_SUM=2 : CartesianRingAllReduce, P2P only, no size cliff
-        // DENSE_DEVICE_SUM=3 : flat RingAllReduce, P2P only
-        // DENSE_DEVICE_SUM=4 : CartesianRingAllGather (branch above)
-        if      (devSum==2) CartesianRingAllReduce(grid,(ComplexF *)&dX[0],nX);
-        else if (devSum==3) RingAllReduce(grid,(ComplexF *)&dX[0],nX);
-        else                grid->GlobalSumVector((ComplexF *)&dX[0], (int)nX);
-      }
-      t3 = usecond();
-    } else {
-      { GRID_TRACE("DenseAllreduce");
-        grid->GlobalSumVector(&hX[0], (int)nX);
-      }
-      t2 = usecond();
-      { GRID_TRACE("DenseH2D");
-        acceleratorCopyToDevice(&hX[0],&dX[0],nX*sizeof(ComplexF));
       }
       t3 = usecond();
     }
@@ -1065,8 +755,8 @@ public:
     }
     double t5 = usecond();
     if (tprof) {
-      tprof[0] = devSum ? (t3-t2) : (t2-t1);   // allreduce
-      tprof[1] = devSum ? (t2-t1) : (t3-t2);   // H2D
+      tprof[0] = t3-t2;                        // allgather
+      tprof[1] = t2-t1;                        // H2D
       tprof[2] = t4-t3;                        // gemm+reduce
       tprof[3] = t5-t4;                        // D2H
     }
@@ -1085,7 +775,7 @@ public:
         sobj s;
         peekLocalSite(s, src, myLcoor[ss]);
         for(int b=0; b<nbasis; b++)
-          hX[ myGsite[ss]*nbasis + b ] = ComplexF(((ComplexD *)&s)[b]);
+          hX[ myGsite[ss]*nbasis + b ] = ComplexF(((CoarseScalar *)&s)[b]);
       }
     }
     SlabApplyPacked(1, nullptr);
@@ -1093,7 +783,7 @@ public:
       for(int ss=0; ss<lsites; ss++){
         sobj s;
         for(int b=0; b<nbasis; b++)
-          ((ComplexD *)&s)[b] = ComplexD(hY[ss*nbasis + b]);
+          ((CoarseScalar *)&s)[b] = CoarseScalar(hY[ss*nbasis + b]);
         pokeLocalSite(s, psi, myLcoor[ss]);
       }
     }
@@ -1130,7 +820,7 @@ public:
           sobj s;
           peekLocalSite(s, src[rr], myLcoor[ss]);
           for(int b=0; b<nbasis; b++)
-            hX[ (uint64_t)rr*N + myGsite[ss]*nbasis + b ] = ComplexF(((ComplexD *)&s)[b]);
+            hX[ (uint64_t)rr*N + myGsite[ss]*nbasis + b ] = ComplexF(((CoarseScalar *)&s)[b]);
         }
       }
     }
@@ -1140,7 +830,7 @@ public:
         for(int ss=0; ss<lsites; ss++){
           sobj s;
           for(int b=0; b<nbasis; b++)
-            ((ComplexD *)&s)[b] = ComplexD(hY[(uint64_t)rr*nrows + (ss*nbasis+b)]);
+            ((CoarseScalar *)&s)[b] = CoarseScalar(hY[(uint64_t)rr*nrows + (ss*nbasis+b)]);
           pokeLocalSite(s, psi[rr], myLcoor[ss]);
         }
       }
@@ -1183,7 +873,7 @@ public:
           sobj s;
           peekLocalSite(s, iv, c6);
           for(int b=0; b<nbasis; b++)
-            hX[(uint64_t)rr*N + myGsite[ss]*nbasis + b] = ComplexF(((ComplexD *)&s)[b]);
+            hX[(uint64_t)rr*N + myGsite[ss]*nbasis + b] = ComplexF(((CoarseScalar *)&s)[b]);
         }
       }
     }
@@ -1200,7 +890,7 @@ public:
           c6[0] = rr;
           sobj s;
           for(int b=0; b<nbasis; b++)
-            ((ComplexD *)&s)[b] = ComplexD(hY[(uint64_t)rr*nrows + (ss*nbasis+b)]);  // Y col-major
+            ((CoarseScalar *)&s)[b] = CoarseScalar(hY[(uint64_t)rr*nrows + (ss*nbasis+b)]);  // Y col-major
           pokeLocalSite(s, ov, c6);
         }
       }
@@ -1208,16 +898,14 @@ public:
     double t6 = usecond();
     std::cout << GridLogMessage << "DenseCoarseMatrix: apply6D " << nr << " rhs took "
               << (t6-t0)/1000.0 << " ms" << std::endl;
-    if ( getenv("DENSE_APPLY_PROFILE") ) {
-      std::cout << GridLogMessage << "DenseCoarseMatrix: apply6D profile:"
-                << " pack "        << (t1-t0)/1000.0
-                << (devSum==4 ? "  allgather " : "  allreduce ")  << tprof[0]/1000.0
-                << "  H2D "        << tprof[1]/1000.0
-                << "  gemm+reduce "<< tprof[2]/1000.0
-                << "  D2H "        << tprof[3]/1000.0
-                << "  unpack "     << (t6-t5)/1000.0
-                << "  ms" << std::endl;
-    }
+    std::cout << GridLogPerformance << "DenseCoarseMatrix: apply6D profile:"
+              << " pack "        << (t1-t0)/1000.0
+              << "  allgather "  << tprof[0]/1000.0
+              << "  H2D "        << tprof[1]/1000.0
+              << "  gemm+reduce "<< tprof[2]/1000.0
+              << "  D2H "        << tprof[3]/1000.0
+              << "  unpack "     << (t6-t5)/1000.0
+              << "  ms" << std::endl;
   }
 };
 

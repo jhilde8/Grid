@@ -82,7 +82,7 @@ void DslashLogPartial(void);
 void DslashLogDirichlet(void);
 
 struct StencilEntry {
-#ifdef GRID_CUDA
+#if defined(GRID_CUDA) || defined(GRID_HIP)
   uint64_t _byte_offset;       // 8 bytes
   uint32_t _offset;            // 4 bytes
 #else
@@ -453,9 +453,19 @@ public:
 	double *dbuf =(double *) packet.recv_buf;
 	float  *fbuf =(float  *) packet.compressed_recv_buf;
 
+	// The lane index is a GPU coalescing optimisation: lane = threadIdx.y
+	// puts adjacent threads on adjacent words.  On a CPU build there are no
+	// SIMT lanes and acceleratorSIMTlane() is identically zero, so the plain
+	// form would convert only 1 word of every nsimd; the #else covers all
+	// lanes explicitly.
 	accelerator_forNB(ss,outer,nsimd,{
+#ifdef GRID_SIMT
 	  int lane = acceleratorSIMTlane(nsimd);
 	  dbuf[ss*nsimd+lane] = fbuf[ss*nsimd+lane]; //conversion
+#else
+	  for(int lane=0;lane<nsimd;lane++)
+	    dbuf[ss*nsimd+lane] = fbuf[ss*nsimd+lane]; //conversion
+#endif
 	});
 
       } else if ( sizeof(word)==4){
@@ -467,8 +477,13 @@ public:
 	uint16_t *hbuf =(uint16_t *) packet.compressed_recv_buf;
 
 	accelerator_forNB(ss,outer,nsimd,{
+#ifdef GRID_SIMT
 	  int lane = acceleratorSIMTlane(nsimd);
 	  fbuf[ss*nsimd+lane] = ((uint32_t)hbuf[ss*nsimd+lane])<<16; //copy back and pad each word with zeroes
+#else
+	  for(int lane=0;lane<nsimd;lane++)
+	    fbuf[ss*nsimd+lane] = ((uint32_t)hbuf[ss*nsimd+lane])<<16; //copy back and pad each word with zeroes
+#endif
 	});
 
       } else {
@@ -515,9 +530,15 @@ public:
 	double *dbuf =(double *) packet.send_buf;
 	float  *fbuf =(float  *) packet.compressed_send_buf;
 
+	// CPU lane coverage as in DecompressPacket.
 	accelerator_forNB(ss,outer,nsimd,{
+#ifdef GRID_SIMT
 	  int lane = acceleratorSIMTlane(nsimd);
 	  fbuf[ss*nsimd+lane] = dbuf[ss*nsimd+lane]; // convert fp64 to fp32
+#else
+	  for(int lane=0;lane<nsimd;lane++)
+	    fbuf[ss*nsimd+lane] = dbuf[ss*nsimd+lane]; // convert fp64 to fp32
+#endif
 	});
 
       } else if ( sizeof(word)==4){
@@ -526,8 +547,13 @@ public:
 	uint16_t *hbuf =(uint16_t *) packet.compressed_send_buf;
 	
 	accelerator_forNB(ss,outer,nsimd,{
+#ifdef GRID_SIMT
 	  int lane = acceleratorSIMTlane(nsimd);
 	  hbuf[ss*nsimd+lane] = fbuf[ss*nsimd+lane]>>16; // convert as in Bagel/BFM ; bfloat16 ; s7e8 Intel patent
+#else
+	  for(int lane=0;lane<nsimd;lane++)
+	    hbuf[ss*nsimd+lane] = fbuf[ss*nsimd+lane]>>16; // convert as in Bagel/BFM ; bfloat16 ; s7e8 Intel patent
+#endif
 	});
 
       } else {
