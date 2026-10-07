@@ -50,7 +50,8 @@ public:
   //Option to speed up *inner single precision* solves using a LinearFunction that produces a guess
   LinearFunction<FieldF> *guesser;
   bool updateResidual;
-  
+  bool ifCGD; // run the final patch-up double-precision solve
+
   // Inner solves on independent partitions of the communicator (--batched-solver-split).
   // BatchedSplit is the partition MPI layout, empty for no split; BatchedSplitNode selects
   // one partition per node. Fixed at construction, default from the command line.
@@ -73,11 +74,12 @@ public:
           LinearOperatorBase<FieldF> &_Linop_f, 
           LinearOperatorBase<FieldD> &_Linop_d,
           bool _updateResidual=true,
+          bool _ifCGD=true,
           const Coordinate &_split=GridDefaultBatchedSolverSplit(),
           bool _split_node=GridDefaultBatchedSolverSplitNode()) :
     Linop_f(_Linop_f), Linop_d(_Linop_d),
     Tolerance(tol), InnerTolerance(tol), MaxInnerIterations(maxinnerit), MaxOuterIterations(maxouterit), MaxPatchupIterations(maxpatchit), SinglePrecGrid(_sp_grid),
-    OuterLoopNormMult(100.), guesser(NULL), updateResidual(_updateResidual),
+    OuterLoopNormMult(100.), guesser(NULL), updateResidual(_updateResidual), ifCGD(_ifCGD),
     BatchedSplit(_split), BatchedSplitNode(_split_node)
   {
     Coordinate layout = BatchedSolverSplitLayout(SinglePrecGrid,BatchedSplit,BatchedSplitNode,Partitions);
@@ -246,15 +248,19 @@ public:
 
     //Final trial CG
     std::cout << GridLogMessage << std::endl;
-    std::cout<<GridLogMessage<<"MixedPrecisionConjugateGradientBatched: Starting final patch-up double-precision solve"<<std::endl;
-    
-    PatchupTimer.Start();
-    for (int i=0; i<NBatch; i++) {
-      ConjugateGradient<FieldD> CG_d(Tolerance, MaxPatchupIterations);
-      CG_d(Linop_d, src_d_in[i], sol_d[i]);
-      TotalFinalStepIterations[i] += CG_d.IterationsToComplete;
+    if(ifCGD){
+      std::cout<<GridLogMessage<<"MixedPrecisionConjugateGradientBatched: Starting final patch-up double-precision solve"<<std::endl;
+
+      PatchupTimer.Start();
+      for (int i=0; i<NBatch; i++) {
+        ConjugateGradient<FieldD> CG_d(Tolerance, MaxPatchupIterations);
+        CG_d(Linop_d, src_d_in[i], sol_d[i]);
+        TotalFinalStepIterations[i] += CG_d.IterationsToComplete;
+      }
+      PatchupTimer.Stop();
+    } else {
+      std::cout<<GridLogMessage<<"MixedPrecisionConjugateGradientBatched: Skipping final patch-up double precision solve"<<std::endl;
     }
-    PatchupTimer.Stop();
 
     TotalTimer.Stop();
 
