@@ -38,7 +38,7 @@ class MixedPrecisionConjugateGradientBatched : public LinearFunction<FieldD> {
 public:
   using LinearFunction<FieldD>::operator();
   RealD   Tolerance;
-  RealD   InnerTolerance; //Initial tolerance for inner CG. Defaults to Tolerance but can be changed
+  RealD   InnerTolerance; //Tolerance for inner CG, and its floor under updateResidual. Defaults to Tolerance but can be changed
   Integer MaxInnerIterations;
   Integer MaxOuterIterations;
   Integer MaxPatchupIterations;
@@ -212,9 +212,11 @@ public:
       if (allConverged) break;
 
       if (updateResidual) {
-        RealD normMax = *std::max_element(std::begin(norm), std::end(norm));
-        RealD stopMax = *std::max_element(std::begin(stop), std::end(stop));
-        while( normMax * inner_tol * inner_tol < stopMax) inner_tol *= 2;  // inner_tol = sqrt(stop/norm) ??
+        // Aim just below the reduction the tightest RHS still needs, sqrt(stop/norm);
+        // rounding up instead leaves up to 2x the target for the serial patch-up.
+        RealD needed = std::sqrt(stop[0] / norm[0]);
+        for (int i=1; i<NBatch; i++) needed = std::min(needed, std::sqrt(stop[i] / norm[i]));
+        inner_tol = std::max(InnerTolerance, 0.9 * needed);
         CG_f.Tolerance = inner_tol;
       }
 

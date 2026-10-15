@@ -38,7 +38,7 @@ NAMESPACE_BEGIN(Grid);
   public:
     using LinearFunction<FieldD>::operator();
     RealD   Tolerance;
-    RealD   InnerTolerance; //Initial tolerance for inner CG. Defaults to Tolerance but can be changed
+    RealD   InnerTolerance; //Tolerance for inner CG, and its floor as the outer residual drops. Defaults to Tolerance but can be changed
     Integer MaxInnerIterations;
     Integer MaxOuterIterations;
     bool ifCGD;
@@ -125,8 +125,9 @@ NAMESPACE_BEGIN(Grid);
 	std::cout<<GridLogMessage<<"MixedPrecisionConjugateGradient: Outer iteration converged on iteration " <<outer_iter <<std::endl;
 	break;
       }
-      while(norm * inner_tol * inner_tol < stop*1.01) inner_tol *= 2;  // inner_tol = sqrt(stop/norm) ??
-      //while(norm * inner_tol * inner_tol < stop) inner_tol *= 2;  // inner_tol = sqrt(stop/norm) ??
+      // Aim just below the reduction still needed, sqrt(stop/norm); rounding up
+      // instead leaves up to 2x the target for the double-precision patch-up.
+      inner_tol = std::max(InnerTolerance, 0.9 * std::sqrt(stop / norm));
 
       PrecChangeTimer.Start();
       precisionChange(src_f, src_d, pc_wk_dp_to_sp);
