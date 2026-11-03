@@ -313,7 +313,7 @@ public:
                    int stride, int start)
   {
     int osites = grid->oSites();
-    int Nsimd  = vobj::Nsimd();
+    constexpr int Nsimd = vobj::Nsimd();
     int lN     = stride;
     int lNsc   = Nsc;
     int lnxyz  = nxyz;
@@ -367,12 +367,12 @@ public:
     GRID_ASSERT(grid != nullptr);
 
     int osites = grid->oSites();
-    int lNsimd = grid->Nsimd();
+    constexpr int lNsimd = vobj::Nsimd();
 
     // The map is indexed sf*vobj::Nsimd() + lane over the bound grid, so the
     // phase field must have the same sites and SIMD width.
     GRID_ASSERT(ph.Grid()->oSites() == osites);
-    GRID_ASSERT(lNsimd == vobj::Nsimd());
+    GRID_ASSERT(grid->Nsimd() == lNsimd);
 
     phase_buf.resize(nxyz);
     scalar *phase_data = &phase_buf[0];
@@ -419,7 +419,7 @@ public:
     scalar **ph = &ph_ptrs[0];
     int lN_j = N_j, lnxyz = nxyz, lNsc = Nsc, lnt = nt, lnmom = nmom;
 
-    accelerator_for(idx, (size_t)((lnmom - 1) * lN_j * lnxyz), lNsc, {
+    accelerator_for(idx, (size_t)((lnmom - 1) * lN_j * lnxyz), (size_t)lNsc, {
       int    m      = 1 + (int)(idx / (lN_j * lnxyz));
       int    rem    = idx % (lN_j * lnxyz);
       int    j      = rem / lnxyz;
@@ -441,7 +441,7 @@ public:
       }
     });
 
-    accelerator_for(idx, (size_t)(lN_j * lnxyz), lNsc, {
+    accelerator_for(idx, (size_t)(lN_j * lnxyz), (size_t)lNsc, {
       int    j      = idx / lnxyz;
       int    l_xyz  = idx % lnxyz;
       scalar ph_val = ph[0][l_xyz];

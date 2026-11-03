@@ -321,7 +321,7 @@ extern sycl::queue *theCopyAccelerator;
 
 accelerator_inline int acceleratorSIMTlane(int Nsimd) {
 #ifdef GRID_SIMT
- return __spirv::initLocalInvocationId<3, sycl::id<3>>()[2]; 
+ return sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_local_id(2);
 #else
  return 0;
 #endif
