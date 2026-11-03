@@ -1682,7 +1682,7 @@ public:
     GRID_ASSERT(off2 >= 0 && off2 + Nk <= (int)loop2.size());
 
     uint64_t oSites = loop.Grid()->oSites();
-    int Nsimd       = SpinColourVector_v::Nsimd();
+    constexpr int Nsimd = SpinColourVector_v::Nsimd();
 
     typedef decltype(loop1[0].View(AcceleratorRead)) View;
     std::vector<View> v1, v2;
@@ -1768,7 +1768,7 @@ public:
     GridBase *grid = dense[0].Grid();
     int nd     = grid->_ndimension;
     int osites = grid->oSites();
-    int Nsimd  = vobj::Nsimd();
+    constexpr int Nsimd = vobj::Nsimd();
 
     Coordinate rdimensions = grid->_rdimensions;
     Coordinate simd        = grid->_simd_layout;
@@ -1814,7 +1814,7 @@ public:
     autoView(tloopv, tloop, AcceleratorWrite);
     autoView(loopv,  loop,  AcceleratorRead);
     uint64_t Osites = loop.Grid()->oSites();
-    int Nsimd = SpinColourMatrix_v::Nsimd();
+    constexpr int Nsimd = SpinColourMatrix_v::Nsimd();
     accelerator_for(ss, Osites, Nsimd, {
       auto l = loopv(ss);
       auto tmp = l; tmp = Zero();
@@ -1839,7 +1839,7 @@ public:
     autoView(tloopv, tloop, AcceleratorWrite);
     autoView(loopv,  loop,  AcceleratorRead);
     uint64_t Osites = loop.Grid()->oSites();
-    int Nsimd = SpinColourMatrix_v::Nsimd();
+    constexpr int Nsimd = SpinColourMatrix_v::Nsimd();
     accelerator_for(ss, Osites, Nsimd, {
       auto l = loopv(ss);
       auto tmp = l; tmp = Zero();
@@ -1862,7 +1862,7 @@ public:
     autoView(tloopv, tloop, AcceleratorWrite);
     autoView(loopv,  loop,  AcceleratorRead);
     uint64_t Osites = loop.Grid()->oSites();
-    int Nsimd = SpinColourMatrix_v::Nsimd();
+    constexpr int Nsimd = SpinColourMatrix_v::Nsimd();
     accelerator_for(ss, Osites, Nsimd, {
       auto l = loopv(ss);
       auto tmp = l; tmp = Zero();
@@ -1895,7 +1895,7 @@ public:
     autoView(tloopv, tloop, AcceleratorWrite);
     autoView(loopv,  loop,  AcceleratorRead);
     uint64_t Osites = loop.Grid()->oSites();
-    int Nsimd = SpinColourMatrix_v::Nsimd();
+    constexpr int Nsimd = SpinColourMatrix_v::Nsimd();
     accelerator_for(ss, Osites, Nsimd, {
       typedef decltype(coalescedRead(loopv[0])) calcSCMatrix;
       typedef iSpinMatrix<typename calcSCMatrix::vector_type> calcSpinMatrix;
@@ -1933,7 +1933,7 @@ public:
     autoView(tlv, tloop,     AcceleratorRead);
     autoView(rv,  right,     AcceleratorRead);
     uint64_t Osites = right.Grid()->oSites();
-    int Nsimd = SpinColourVector_v::Nsimd();
+    constexpr int Nsimd = SpinColourVector_v::Nsimd();
     accelerator_for(ss, Osites, Nsimd, {
       typedef decltype(coalescedRead(rv[0]))  calcSCVector;
       typedef decltype(coalescedRead(tlv[0])) calcSCMatrix;
@@ -1968,7 +1968,7 @@ public:
     autoView(tlv, tloop,     AcceleratorRead);
     autoView(rv,  right,     AcceleratorRead);
     uint64_t Osites = right.Grid()->oSites();
-    int Nsimd = SpinColourVector_v::Nsimd();
+    constexpr int Nsimd = SpinColourVector_v::Nsimd();
     accelerator_for(ss, Osites, Nsimd, {
       coalescedWrite(lRv[ss], tlv(ss) * rv(ss));
     });
@@ -1989,7 +1989,7 @@ public:
     autoView(tlv, tloop,     AcceleratorRead);
     autoView(rv,  right,     AcceleratorRead);
     uint64_t Osites = right.Grid()->oSites();
-    int Nsimd = SpinColourVector_v::Nsimd();
+    constexpr int Nsimd = SpinColourVector_v::Nsimd();
     accelerator_for(ss, Osites, Nsimd, {
       typedef decltype(coalescedRead(rv[0])) calcSCVector;
       auto loopm  = tlv(ss);
@@ -2022,7 +2022,7 @@ public:
     autoView(tlv, tloop,     AcceleratorRead);
     autoView(rv,  right,     AcceleratorRead);
     uint64_t Osites = right.Grid()->oSites();
-    int Nsimd = SpinColourVector_v::Nsimd();
+    constexpr int Nsimd = SpinColourVector_v::Nsimd();
     accelerator_for(ss, Osites, Nsimd, {
       typedef decltype(coalescedRead(rv[0])) calcSCVector;
       auto loopm  = tlv(ss);
@@ -2235,7 +2235,7 @@ public:
     int lParity = parity;
 
     uint64_t oSites = right.Grid()->oSites();
-    int      Nsimd  = SpinColourVector_v::Nsimd();
+    constexpr int Nsimd = SpinColourVector_v::Nsimd();
 
     accelerator_for(ss, oSites, Nsimd, {
       typedef decltype(coalescedRead(rv[0])) calcSCVector;
