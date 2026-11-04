@@ -560,7 +560,7 @@ void BaryonUtils<FImpl>::ContractBaryons(const PropagatorField &q1_left,
   Real t=0.;
   t =-usecond();
 
-  accelerator_for(ss, grid->oSites(), grid->Nsimd(), {
+  accelerator_for(ss, grid->oSites(), (size_t)grid->Nsimd(), {
     auto D1 = v1(ss);
     auto D2 = v2(ss);
     auto D3 = v3(ss);
@@ -597,7 +597,7 @@ void BaryonUtils<FImpl>::ContractBaryonsMatrix(const PropagatorField &q1_left,
   autoView( v2          , q2_left     , AcceleratorRead);
   autoView( v3          , q3_left     , AcceleratorRead);
 
-  accelerator_for(ss, grid->oSites(), grid->Nsimd(), {
+  accelerator_for(ss, grid->oSites(), (size_t)grid->Nsimd(), {
     auto D1 = v1(ss);
     auto D2 = v2(ss);
     auto D3 = v3(ss);
@@ -977,7 +977,7 @@ void BaryonUtils<FImpl>::BaryonGamma3pt(
   mobj * Dq_spec_p = &my_Dq_spec[0];
 
   if (group == 1) {
-    accelerator_for(ss, grid->oSites(), grid->Nsimd(), {
+    accelerator_for(ss, grid->oSites(), (size_t)grid->Nsimd(), {
       auto Dq_ti = vq_ti(ss);
       auto Dq_tf = vq_tf(ss);
       typedef decltype(coalescedRead(vcorr[0])) spinor;
@@ -986,7 +986,7 @@ void BaryonUtils<FImpl>::BaryonGamma3pt(
       coalescedWrite(vcorr[ss],coalescedRead(vcorr[ss])+result); 
     });//end loop over lattice sites
   } else if (group == 2) {
-    accelerator_for(ss, grid->oSites(), grid->Nsimd(), {
+    accelerator_for(ss, grid->oSites(), (size_t)grid->Nsimd(), {
       auto Dq_ti = vq_ti(ss);
       auto Dq_tf = vq_tf(ss);
       typedef decltype(coalescedRead(vcorr[0])) spinor;
@@ -995,7 +995,7 @@ void BaryonUtils<FImpl>::BaryonGamma3pt(
       coalescedWrite(vcorr[ss],coalescedRead(vcorr[ss])+result); 
     });//end loop over lattice sites
   } else if (group == 3) {
-    accelerator_for(ss, grid->oSites(), grid->Nsimd(), {
+    accelerator_for(ss, grid->oSites(), (size_t)grid->Nsimd(), {
       auto Dq_ti = vq_ti(ss);
       auto Dq_tf = vq_tf(ss);
       typedef decltype(coalescedRead(vcorr[0])) spinor;
@@ -1307,7 +1307,7 @@ void BaryonUtils<FImpl>::SigmaToNucleonEye(const PropagatorField &qq_loop,
   mobj * Dq_spec_p = &my_Dq_spec[0];
 
   if(op == "Q1"){
-    accelerator_for(ss, grid->oSites(), grid->Nsimd(), {
+    accelerator_for(ss, grid->oSites(), (size_t)grid->Nsimd(), {
       auto Dq_loop = vq_loop(ss);
       auto Dd_tf = vd_tf(ss);
       auto Ds_ti = vs_ti(ss);
@@ -1317,7 +1317,7 @@ void BaryonUtils<FImpl>::SigmaToNucleonEye(const PropagatorField &qq_loop,
       coalescedWrite(vcorr[ss],result);
     });//end loop over lattice sites
   } else if(op == "Q2"){
-    accelerator_for(ss, grid->oSites(), grid->Nsimd(), {
+    accelerator_for(ss, grid->oSites(), (size_t)grid->Nsimd(), {
       auto Dq_loop = vq_loop(ss);
       auto Dd_tf = vd_tf(ss);
       auto Ds_ti = vs_ti(ss);
@@ -1361,7 +1361,7 @@ void BaryonUtils<FImpl>::SigmaToNucleonNonEye(const PropagatorField &qq_ti,
   mobj * Dq_spec_p = &my_Dq_spec[0];
 
   if(op == "Q1"){
-    accelerator_for(ss, grid->oSites(), grid->Nsimd(), {
+    accelerator_for(ss, grid->oSites(), (size_t)grid->Nsimd(), {
       auto Dq_ti = vq_ti(ss);
       auto Dq_tf = vq_tf(ss);
       auto Dd_tf = vd_tf(ss);
@@ -1372,7 +1372,7 @@ void BaryonUtils<FImpl>::SigmaToNucleonNonEye(const PropagatorField &qq_ti,
       coalescedWrite(vcorr[ss],result);
     });//end loop over lattice sites
   } else if(op == "Q2"){
-    accelerator_for(ss, grid->oSites(), grid->Nsimd(), {
+    accelerator_for(ss, grid->oSites(), (size_t)grid->Nsimd(), {
       auto Dq_ti = vq_ti(ss);
       auto Dq_tf = vq_tf(ss);
       auto Dd_tf = vd_tf(ss);
@@ -1554,7 +1554,7 @@ void BaryonUtils<FImpl>::XiToSigmaEye(const PropagatorField &qq_loop,
   mobj * Dq_spec_p = &my_Dq_spec[0];
 
   if(op == "Q1"){
-    accelerator_for(ss, grid->oSites(), grid->Nsimd(), {
+    accelerator_for(ss, grid->oSites(), (size_t)grid->Nsimd(), {
       auto Dq_loop = vq_loop(ss);
       auto Dd_tf   = vd_tf(ss);
       auto Ds_ti   = vs_ti(ss);
@@ -1564,7 +1564,7 @@ void BaryonUtils<FImpl>::XiToSigmaEye(const PropagatorField &qq_loop,
       coalescedWrite(vcorr[ss],result);
     }  );//end loop over lattice sites
   } else if(op == "Q2"){
-    accelerator_for(ss, grid->oSites(), grid->Nsimd(), {
+    accelerator_for(ss, grid->oSites(), (size_t)grid->Nsimd(), {
       auto Dq_loop = vq_loop(ss);
       auto Dd_tf   = vd_tf(ss);
       auto Ds_ti   = vs_ti(ss);
