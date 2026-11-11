@@ -254,6 +254,12 @@ public:
       // into SIMD vectors indexed by the reduced time coordinate.
       t0 = usecond();
       std::vector<Scalar_v> lvSum(MFrvol, Zero());
+      // Phase views open here, not per site inside thread_for as in
+      // A2AFewMesonField: concurrent ViewOpen/Close races the MemoryManager LRU.
+      typedef decltype(ph[0].View(CpuRead)) PhView;
+      std::vector<PhView> mom_v;
+      mom_v.reserve(nmom);
+      for (int m = 0; m < nmom; m++) mom_v.push_back(ph[m].View(CpuRead));
       thread_for(r, rd, {
         int so = r * ostr;
         for (int n = 0; n < e1; n++)
@@ -268,13 +274,13 @@ public:
                         + leftv[ii + iii][ss]()(s)(c) * rightv[jj + jjj][ss]()(s)(c);
             for (int m = 0; m < nmom; m++) {
               size_t idx = m + nmom * (jjj + Njjj * (iii + Niii * (size_t)r));
-              autoView(mom_v, ph[m], CpuRead);
-              auto phase = mom_v[ss];
+              auto phase = mom_v[m][ss];
               mac(&lvSum[idx], &tmp, &phase);
             }
           }
         }
       });
+      for (int m = 0; m < nmom; m++) mom_v[m].ViewClose();
       t_contract += usecond() - t0;
 
       // Stage 2: unpack the SIMD lanes onto the local time coordinate.
